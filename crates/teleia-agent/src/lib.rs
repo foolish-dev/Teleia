@@ -33,12 +33,6 @@ pub trait ToolRouter: Send {
     }
 }
 
-// Filename is capital-K (matches `Karpathy.md` at the workspace root),
-// but the module identifier stays snake_case so callers keep using
-// `karpathy::GUIDELINES`.
-#[path = "Karpathy.rs"]
-mod karpathy;
-
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TokenCounts {
     pub prompt: u64,
@@ -142,17 +136,16 @@ or outward-facing — a push, a release, a delete outside the worktree — and b
 is the user's to make. Always be concise. When you finish a turn, stop — \
 do not narrate.";
 
-/// Base prompt + the Karpathy-derived guidelines, joined once at startup.
+/// The system turn every session opens with.
 fn system_prompt() -> String {
-    format!("{SYSTEM_PROMPT_BASE}\n\n{}", karpathy::GUIDELINES)
+    SYSTEM_PROMPT_BASE.to_string()
 }
 
 /// Replace whatever system turn a stored session carries with the
 /// current [`system_prompt`]. Sessions persist message 0 verbatim, so
 /// without this a resumed session keeps the prompt frozen at the moment
-/// it was created — an edit to `Karpathy.md` or [`SYSTEM_PROMPT_BASE`]
-/// would reach new sessions only. Retain-then-insert rather than
-/// overwriting index 0:
+/// it was created — a change to [`SYSTEM_PROMPT_BASE`] would reach new
+/// sessions only. Retain-then-insert rather than overwriting index 0:
 /// a session whose seq-0 row was skipped as corrupt has no system turn
 /// there, and the providers concatenate every system turn wherever it
 /// sits.
@@ -2126,41 +2119,6 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    #[test]
-    fn system_prompt_appends_the_guidelines_after_the_base() {
-        // The base prompt and the guidelines are joined in exactly one
-        // place; a resumed session re-renders through the same function
-        // (`sync_system_prompt`), so this is the only assertion of the
-        // join. The blank line matters: the guidelines are standalone
-        // markdown and must not run into the base prompt's last sentence.
-        let prompt = system_prompt();
-        assert!(prompt.starts_with(SYSTEM_PROMPT_BASE));
-        assert!(prompt[SYSTEM_PROMPT_BASE.len()..].starts_with("\n\n"));
-        assert!(prompt.ends_with(karpathy::GUIDELINES));
-        assert!(!karpathy::GUIDELINES.trim().is_empty());
-    }
-
-    #[test]
-    fn guidelines_name_only_tools_that_still_exist() {
-        // Karpathy.md §4 routes the model through two builtins by name:
-        // `test` for the workspace-wide run, `bash` for the narrowed
-        // `cargo test -p <crate> <name>`. Rename either tool and the
-        // guidance silently directs the model at nothing, with nothing
-        // else in the tree to catch it — so pin both sides.
-        for tool in ["test", "bash"] {
-            assert!(
-                teleia_tools::definitions()
-                    .iter()
-                    .any(|d| d.function.name == tool),
-                "Karpathy.md directs the model at `{tool}`, no longer a builtin"
-            );
-            assert!(
-                karpathy::GUIDELINES.contains(&format!("`{tool}`")),
-                "Karpathy.md no longer names `{tool}`"
-            );
-        }
     }
 
     #[test]
