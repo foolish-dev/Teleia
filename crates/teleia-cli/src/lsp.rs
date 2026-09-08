@@ -277,30 +277,29 @@ impl LspClient {
             version: Option<String>,
         }
         #[derive(Deserialize)]
-        struct ServerCaps {
-            #[serde(rename = "definitionProvider", default)]
-            definition: Value,
-            #[serde(rename = "referencesProvider", default)]
-            references: Value,
-            #[serde(rename = "workspaceSymbolProvider", default)]
-            workspace_symbol: Value,
-        }
-        #[derive(Deserialize)]
         struct InitResult {
             #[serde(rename = "serverInfo", default)]
             server_info: Option<ServerInfo>,
-            #[serde(default)]
-            capabilities: Option<ServerCaps>,
         }
+        // Read straight off the `Value` rather than through the same
+        // struct as `serverInfo`: one server sending an unexpected shape
+        // for the purely decorative `serverInfo.name` would otherwise
+        // fail the whole deserialise and silently disable all three
+        // tools for it.
+        let cap = |field: &str| {
+            provider_enabled(
+                result
+                    .pointer(&format!("/capabilities/{field}"))
+                    .unwrap_or(&Value::Null),
+            )
+        };
+        self.supports_definition = cap("definitionProvider");
+        self.supports_references = cap("referencesProvider");
+        self.supports_workspace_symbol = cap("workspaceSymbolProvider");
         if let Ok(init) = serde_json::from_value::<InitResult>(result) {
             if let Some(s) = init.server_info {
                 self.server_name = Some(s.name);
                 self.server_version = s.version;
-            }
-            if let Some(c) = init.capabilities {
-                self.supports_definition = provider_enabled(&c.definition);
-                self.supports_references = provider_enabled(&c.references);
-                self.supports_workspace_symbol = provider_enabled(&c.workspace_symbol);
             }
         }
         self.notify("initialized", json!({})).await?;
@@ -310,7 +309,7 @@ impl LspClient {
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         if self.desynced {
             return Err(anyhow!(
-                "LSP `{}` desynchronised after a timed-out request; restart teleia to use it again",
+                "LSP `{}` is out of sync after an abandoned request",
                 self.name
             ));
         }
@@ -323,43 +322,63 @@ impl LspClient {
             "params": params,
         });
         self.write_frame(&payload).await?;
+        // Poison first, clear only once a whole frame has come back.
+        //
+        // `read_line`/`read_exact` are not cancel-safe: bytes already
+        // consumed are gone, and the rest of that frame would be parsed
+        // as the next one's headers. The timeout below is not the only
+        // thing that can cancel the read — Esc or Ctrl-C drops the whole
+        // turn future mid-request, and no line written *after* the await
+        // would ever run. Setting the flag before means every abandoned
+        // read leaves it set, and only a clean return clears it.
+        //
+        // A server's own error response clears it too: receiving one
+        // means a complete frame was read, so the stream is intact even
+        // though the call failed. A transport error does not.
+        self.desynced = true;
         // Bound the wait the way `spawn` bounds the handshake. A cold
         // rust-analyzer can take tens of seconds to answer
         // `textDocument/references`; past this the whole turn is parked
         // with nothing on screen to explain it.
         let timeout = std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS);
-        match tokio::time::timeout(timeout, self.await_response(id)).await {
-            Ok(r) => r,
-            Err(_) => {
-                // The timeout cancels `await_response` mid-frame, and
-                // `read_line`/`read_exact` are not cancel-safe: the bytes
-                // already consumed are gone and the rest of that frame
-                // would be parsed as the next one's headers. Every later
-                // answer from this server would be garbage, so refuse
-                // them all rather than serve one.
-                self.desynced = true;
-                Err(anyhow!(
-                    "LSP `{}` did not answer `{method}` within {REQUEST_TIMEOUT_SECS}s",
-                    self.name
-                ))
-            }
+        let Ok(framed) = tokio::time::timeout(timeout, self.await_response(id)).await else {
+            return Err(anyhow!(
+                "LSP `{}` did not answer `{method}` within {REQUEST_TIMEOUT_SECS}s",
+                self.name
+            ));
+        };
+        let msg = framed?;
+        self.desynced = false;
+        if let Some(err) = msg.get("error") {
+            return Err(anyhow!("LSP `{}` returned error: {err}", self.name));
         }
+        Ok(msg.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    /// Read frames until the response to `id` arrives. Split out of
-    /// [`LspClient::request`] so the timeout covers only the read — a
-    /// cancelled *write* would leave a half-written frame in the
-    /// server's parser, desynchronising the other direction too.
+    /// Whether this client can still be asked anything. False once a read
+    /// was abandoned mid-frame — the registry drops it from its fan-outs
+    /// rather than let it answer "nothing found" for every later query.
+    fn usable(&self) -> bool {
+        !self.desynced
+    }
+
+    /// Read frames until the response to `id` arrives, and return it
+    /// whole — including an `error` response, which [`LspClient::request`]
+    /// unpacks. Returning at all means a complete frame was read, which
+    /// is exactly what `request` needs to know to un-poison the stream,
+    /// so the JSON-RPC-level failure must not be reported the same way a
+    /// transport failure is.
+    ///
+    /// Split out of `request` so the timeout covers only the read: a
+    /// cancelled *write* would leave a half-written frame in the server's
+    /// parser, desynchronising the other direction too.
     async fn await_response(&mut self, id: u64) -> Result<Value> {
         // Skip over server-initiated notifications (no `id`) until the
         // matching response arrives.
         loop {
             let msg = self.read_frame().await?;
             if is_response_to(&msg, id) {
-                if let Some(err) = msg.get("error") {
-                    return Err(anyhow!("LSP `{}` returned error: {err}", self.name));
-                }
-                return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
+                return Ok(msg);
             }
             // Not our response. A server->client *request* (has `method` and
             // `id`) must be answered or a server that blocks on our reply
@@ -373,6 +392,14 @@ impl LspClient {
     }
 
     async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        // Nothing drains this server's stdout any more, so a `didOpen`
+        // pushed at it only fills a pipe no one will read.
+        if self.desynced {
+            return Err(anyhow!(
+                "LSP `{}` is out of sync after an abandoned request",
+                self.name
+            ));
+        }
         let payload = json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -594,6 +621,11 @@ impl LspClient {
 /// in a large workspace — but finite, because the turn is parked for
 /// the whole wait.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Why a client stopped answering, in the one wording every tool uses.
+/// A server whose read was abandoned mid-frame cannot be resynchronised
+/// without a restart, and saying so beats an unexplained absence.
+const DESYNC_NOTE: &str = "out of sync after an abandoned request";
 
 /// Row caps, per tool. `teleia-agent` trims any tool result past 12k
 /// characters, keeping the head and tail and eliding the middle — which
@@ -1020,9 +1052,23 @@ fn trim_source_line(s: &str) -> String {
 /// different token and answers confidently about that instead.
 fn identifier_at(line_text: &str, character: u32) -> Option<String> {
     let chars: Vec<char> = line_text.chars().collect();
-    let i = character as usize;
+    // `character` counts UTF-16 code units, which is only the same as a
+    // char index while the line is all-BMP. An emoji earlier in the line
+    // shifts everything after it by one, and a header naming the wrong
+    // symbol is worse than a header naming none — so a column landing
+    // mid-surrogate, or past the end, gives up rather than guesses.
+    let mut units = 0u32;
+    let mut at = None;
+    for (idx, c) in chars.iter().enumerate() {
+        if units == character {
+            at = Some(idx);
+            break;
+        }
+        units += c.len_utf16() as u32;
+    }
+    let i = at?;
     let word = |c: char| c.is_alphanumeric() || c == '_';
-    if !chars.get(i).copied().is_some_and(word) {
+    if !word(chars[i]) {
         return None;
     }
     let mut start = i;
@@ -1212,6 +1258,20 @@ pub fn root_matches(dir: &Path, patterns: &[String]) -> bool {
     false
 }
 
+/// Attach the servers that failed to an otherwise-empty answer.
+///
+/// A bare "nothing found" from a server that never answered is the one
+/// lie these tools must not tell — `lsp_references`' own description
+/// sends the model on to delete code as unused on the strength of it,
+/// and cross-checking with `lsp_hover` agrees, because the same dead
+/// client answers that too.
+fn qualify(sentinel: String, failures: &[String]) -> String {
+    if failures.is_empty() {
+        return sentinel;
+    }
+    format!("{sentinel}\n[not answered — {}]", failures.join("; "))
+}
+
 /// Set of running LSP clients. Used by the TUI's `/lsps` panel — for
 /// now the registry just owns the clients so they stay alive (the LSP
 /// children are killed on Drop via `kill_on_drop`) and exposes a
@@ -1278,9 +1338,16 @@ impl LspRegistry {
     pub async fn diagnostics_for(&mut self, path: &str) -> Result<String> {
         let (abs, uri, text, language_id) = document_context(path)?;
         let mut all: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
         for client in self.clients.iter_mut() {
+            if !client.usable() {
+                failures.push(format!("{}: {}", client.name, DESYNC_NOTE));
+                continue;
+            }
             // Best-effort per server: ignore didOpen failures (some
-            // servers refuse languages they don't recognise).
+            // servers refuse languages they don't recognise). A refusal
+            // is not a failure to report — it is why a Python server
+            // says nothing about a Rust file.
             if client
                 .open_document(&uri, &language_id, &text)
                 .await
@@ -1288,12 +1355,20 @@ impl LspRegistry {
             {
                 continue;
             }
-            if let Ok(lines) = client.pull_diagnostics(&uri).await {
-                all.extend(lines);
+            match client.pull_diagnostics(&uri).await {
+                Ok(lines) => all.extend(lines),
+                // Not swallowed: a clean bill of health for a file full
+                // of errors is worse than no answer at all, and unlike
+                // the other tools there is no capability flag here to
+                // tell the two apart.
+                Err(e) => failures.push(format!("{}: {e}", client.name)),
             }
         }
         if all.is_empty() {
-            Ok(format!("no diagnostics for {}", abs.display()))
+            Ok(qualify(
+                format!("no diagnostics for {}", abs.display()),
+                &failures,
+            ))
         } else {
             Ok(all.join("\n"))
         }
@@ -1311,7 +1386,12 @@ impl LspRegistry {
         let lsp_char = character.saturating_sub(1);
 
         let mut blobs: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
         for client in self.clients.iter_mut() {
+            if !client.usable() {
+                failures.push(format!("{}: {}", client.name, DESYNC_NOTE));
+                continue;
+            }
             if client
                 .open_document(&uri, &language_id, &text)
                 .await
@@ -1319,16 +1399,16 @@ impl LspRegistry {
             {
                 continue;
             }
-            if let Ok(Some(h)) = client.hover(&uri, lsp_line, lsp_char).await {
-                blobs.push(h);
+            match client.hover(&uri, lsp_line, lsp_char).await {
+                Ok(Some(h)) => blobs.push(h),
+                Ok(None) => {}
+                Err(e) => failures.push(format!("{}: {e}", client.name)),
             }
         }
         if blobs.is_empty() {
-            Ok(format!(
-                "no hover info at {}:{}:{}",
-                abs.display(),
-                line,
-                character
+            Ok(qualify(
+                format!("no hover info at {}:{}:{}", abs.display(), line, character),
+                &failures,
             ))
         } else {
             Ok(blobs.join("\n\n---\n\n"))
@@ -1351,37 +1431,55 @@ impl LspRegistry {
         line: u32,
         character: u32,
     ) -> Result<String> {
-        if !self.clients.iter().any(|c| c.supports_definition) {
+        if !self
+            .clients
+            .iter()
+            .any(|c| c.supports_definition && c.usable())
+        {
             return Ok("no language server advertises textDocument/definition".to_string());
         }
         let (abs, uri, text, language_id) = document_context(path)?;
         let (l, c) = (line.saturating_sub(1), character.saturating_sub(1));
 
         let mut hits: Vec<(Loc, String)> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
         for client in self.clients.iter_mut() {
-            if client
-                .open_document(&uri, &language_id, &text)
-                .await
-                .is_err()
-            {
+            if !client.supports_definition {
                 continue;
             }
-            if let Ok(locs) = client.definition(&uri, l, c).await {
-                let server = client.name.clone();
-                hits.extend(locs.into_iter().map(|loc| (loc, server.clone())));
+            if !client.usable() {
+                failures.push(format!("{}: {}", client.name, DESYNC_NOTE));
+                continue;
+            }
+            // Same reason `references_for` does it: this answer carries
+            // positions in files other than the one being synced, and a
+            // server resolving against a buffer the agent has since
+            // edited reports pre-edit line numbers — under a source line
+            // read fresh from disk, which makes the row look verified.
+            client.resync_open_documents().await;
+            if let Err(e) = client.open_document(&uri, &language_id, &text).await {
+                failures.push(format!("{}: {e}", client.name));
+                continue;
+            }
+            match client.definition(&uri, l, c).await {
+                Ok(locs) => {
+                    let server = client.name.clone();
+                    hits.extend(locs.into_iter().map(|loc| (loc, server.clone())));
+                }
+                Err(e) => failures.push(format!("{}: {e}", client.name)),
             }
         }
         let hits = dedupe_locations(hits);
         if hits.is_empty() {
-            return Ok(format!(
-                "no definition at {}:{}:{}",
-                abs.display(),
-                line,
-                character
+            return Ok(qualify(
+                format!("no definition at {}:{}:{}", abs.display(), line, character),
+                &failures,
             ));
         }
         let total = hits.len();
-        let rows = render_location_rows(&hits, "definition");
+        // Render only what can survive the cap: every row costs a read of
+        // the file it points at.
+        let rows = render_location_rows(&hits[..MAX_DEFINITION_ROWS.min(total)], "definition");
         let keep = apply_cap(&rows, MAX_DEFINITION_ROWS, ROW_CHAR_BUDGET);
         let mut out: Vec<String> = rows[..keep].to_vec();
         if keep < total {
@@ -1400,34 +1498,44 @@ impl LspRegistry {
         line: u32,
         character: u32,
     ) -> Result<String> {
-        if !self.clients.iter().any(|c| c.supports_references) {
+        if !self
+            .clients
+            .iter()
+            .any(|c| c.supports_references && c.usable())
+        {
             return Ok("no language server advertises textDocument/references".to_string());
         }
         let (abs, uri, text, language_id) = document_context(path)?;
         let (l, c) = (line.saturating_sub(1), character.saturating_sub(1));
 
         let mut hits: Vec<(Loc, String)> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
         for client in self.clients.iter_mut() {
-            client.resync_open_documents().await;
-            if client
-                .open_document(&uri, &language_id, &text)
-                .await
-                .is_err()
-            {
+            if !client.supports_references {
                 continue;
             }
-            if let Ok(locs) = client.references(&uri, l, c).await {
-                let server = client.name.clone();
-                hits.extend(locs.into_iter().map(|loc| (loc, server.clone())));
+            if !client.usable() {
+                failures.push(format!("{}: {}", client.name, DESYNC_NOTE));
+                continue;
+            }
+            client.resync_open_documents().await;
+            if let Err(e) = client.open_document(&uri, &language_id, &text).await {
+                failures.push(format!("{}: {e}", client.name));
+                continue;
+            }
+            match client.references(&uri, l, c).await {
+                Ok(locs) => {
+                    let server = client.name.clone();
+                    hits.extend(locs.into_iter().map(|loc| (loc, server.clone())));
+                }
+                Err(e) => failures.push(format!("{}: {e}", client.name)),
             }
         }
         let hits = dedupe_locations(hits);
         if hits.is_empty() {
-            return Ok(format!(
-                "no references at {}:{}:{}",
-                abs.display(),
-                line,
-                character
+            return Ok(qualify(
+                format!("no references at {}:{}:{}", abs.display(), line, character),
+                &failures,
             ));
         }
 
@@ -1451,7 +1559,7 @@ impl LspRegistry {
             None => format!("{total} references from {at} in {files} files:"),
         };
 
-        let rows = render_location_rows(&hits, "reference");
+        let rows = render_location_rows(&hits[..MAX_REFERENCE_ROWS.min(total)], "reference");
         let keep = apply_cap(&rows, MAX_REFERENCE_ROWS, ROW_CHAR_BUDGET);
         let mut out = vec![header];
         out.extend(rows[..keep].iter().cloned());
@@ -1471,19 +1579,41 @@ impl LspRegistry {
     /// gopls fuzzy-rank, so the exact match comes first, and re-sorting
     /// by path would throw that away.
     pub async fn symbols_for(&mut self, query: &str) -> Result<String> {
-        if !self.clients.iter().any(|c| c.supports_workspace_symbol) {
+        if !self
+            .clients
+            .iter()
+            .any(|c| c.supports_workspace_symbol && c.usable())
+        {
             return Ok("no language server advertises workspace/symbol".to_string());
         }
         let mut rows: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
         for client in self.clients.iter_mut() {
-            let Ok(hits) = client.workspace_symbols(query).await else {
+            if !client.supports_workspace_symbol {
                 continue;
-            };
-            let server = client.name.clone();
-            rows.extend(hits.iter().map(|h| format_symbol_row(h, &server)));
+            }
+            if !client.usable() {
+                failures.push(format!("{}: {}", client.name, DESYNC_NOTE));
+                continue;
+            }
+            // This request opens no document, but the index it searches
+            // is layered over the buffers the server holds — so an
+            // already-open file the agent has since edited yields stale
+            // symbol positions unless it is pushed again first.
+            client.resync_open_documents().await;
+            match client.workspace_symbols(query).await {
+                Ok(hits) => {
+                    let server = client.name.clone();
+                    rows.extend(hits.iter().map(|h| format_symbol_row(h, &server)));
+                }
+                Err(e) => failures.push(format!("{}: {e}", client.name)),
+            }
         }
         if rows.is_empty() {
-            return Ok(format!("no symbols matching \"{query}\""));
+            return Ok(qualify(
+                format!("no symbols matching \"{query}\""),
+                &failures,
+            ));
         }
         let total = rows.len();
         let keep = apply_cap(&rows, MAX_SYMBOL_ROWS, ROW_CHAR_BUDGET);
@@ -2109,6 +2239,21 @@ mod tests {
     }
 
     #[test]
+    fn identifier_at_reads_the_column_as_utf16_code_units() {
+        // `🦀` is one char but two UTF-16 units, so the identifier after
+        // it starts at column 4, not 3. Reading the column as a char
+        // index would land on `o` and answer `foo` for a request about
+        // whatever sits one column later.
+        assert_eq!(identifier_at("// 🦀 foo", 6).as_deref(), Some("foo"));
+        // The char index a naive reading would use points elsewhere.
+        assert_eq!(identifier_at("// 🦀 foo", 5), None);
+        // A column landing inside the surrogate pair resolves to nothing
+        // rather than to a neighbour.
+        assert_eq!(identifier_at("🦀x", 1), None);
+        assert_eq!(identifier_at("🦀x", 2).as_deref(), Some("x"));
+    }
+
+    #[test]
     fn identifier_at_returns_none_off_an_identifier() {
         assert_eq!(identifier_at("let x = 1;", 3), None); // space
         assert_eq!(identifier_at("let x = 1;", 6), None); // `=`
@@ -2261,6 +2406,29 @@ mod tests {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(root_matches(crate_dir, &["*.lock".into()]));
         assert!(!root_matches(crate_dir, &["*.nope-xyz".into()]));
+    }
+
+    #[test]
+    fn qualify_marks_an_empty_answer_that_nobody_answered() {
+        // The sentinel alone is a claim about the code; with a server
+        // that never replied it is a claim about nothing. `lsp_references`
+        // tells the model this string means "nothing uses it" and to
+        // cross-check with `lsp_hover` — which the same dead client also
+        // answers emptily, so both signals agree on the wrong thing.
+        let clean = qualify("no references at /a.rs:1:1".into(), &[]);
+        assert_eq!(clean, "no references at /a.rs:1:1");
+
+        let failed = qualify(
+            "no references at /a.rs:1:1".into(),
+            &[format!("rust: {DESYNC_NOTE}")],
+        );
+        assert_eq!(
+            failed,
+            format!("no references at /a.rs:1:1\n[not answered — rust: {DESYNC_NOTE}]")
+        );
+        // Every server that failed is named, not just the first.
+        let two = qualify("x".into(), &["a: boom".into(), "b: bang".into()]);
+        assert!(two.contains("a: boom") && two.contains("b: bang"), "{two}");
     }
 
     #[test]

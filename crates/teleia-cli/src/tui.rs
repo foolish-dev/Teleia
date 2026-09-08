@@ -106,7 +106,7 @@ fn set_mode(state: &mut State, agent: &mut Agent, mode: PermissionMode) {
     set_pref_warn(state, agent, "permission_mode", mode.label_canonical());
     let blurb = match mode {
         PermissionMode::Plan => {
-            "plan mode — inspection built-ins run; fetch/web_search/env/lint/typecheck/test prompt y/n; write/edit/bash and every MCP/LSP tool are blocked. Use Shift+Tab or /build to execute."
+            "plan mode — inspection built-ins and the read-only lsp_* queries run; fetch/web_search/env/lint/typecheck/test prompt y/n; write/edit/bash and every MCP tool are blocked. Use Shift+Tab or /build to execute."
         }
         PermissionMode::Build => "build mode — every tool call prompts y/n/a.",
         PermissionMode::Auto => {

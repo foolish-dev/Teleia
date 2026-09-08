@@ -279,9 +279,11 @@ pub enum PermissionMode {
     /// without prompting; tools that reach the network or compile the
     /// working tree (`fetch` / `web_search` / `env` / `lint` /
     /// `typecheck` / `test`) prompt on build mode's approval path; and
-    /// `write` / `edit` / `bash`, plus every MCP/LSP tool whatever it is
-    /// named, short-circuit with a synthetic "blocked: plan mode" tool
-    /// result so the model is pushed toward describing what it would do.
+    /// `write` / `edit` / `bash`, plus every routed tool whose router
+    /// does not declare it read-only (see [`ToolRouter::inspects_only`])
+    /// whatever it is named, short-circuit with a synthetic "blocked:
+    /// plan mode" tool result so the model is pushed toward describing
+    /// what it would do.
     Plan,
     /// Default: every tool call yields a `ToolApprovalRequest` and
     /// waits for the user's y/n/a.
@@ -393,17 +395,6 @@ fn needs_consent(name: &str) -> bool {
     )
 }
 
-/// Plan-mode policy for one concrete call, argument-aware where the
-/// name alone is too coarse. `git` mutates via `add`/`commit`, so its
-/// inspection subcommands stay unprompted — but only with a pathspec
-/// that can't be read as a flag: `paths` is appended to git's argv with
-/// no `--` separator (teleia-tools:1612), so `paths: ["--output=FILE"]`
-/// makes `git diff` write a file. `routed` is whether an MCP/LSP server
-/// claims this name — servers name their own tools with no namespacing
-/// (cli/src/mcp.rs:438) and are dispatched ahead of the built-ins, so
-/// without this a server advertising `read` would inherit `read`'s
-/// unprompted pass and run third-party code in the one mode that
-/// promises nothing runs.
 /// How a tool call reached the dispatcher — the first thing
 /// [`plan_gate`] keys on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,6 +416,17 @@ impl Routing {
     }
 }
 
+/// Plan-mode policy for one concrete call, argument-aware where the
+/// name alone is too coarse. `git` mutates via `add`/`commit`, so its
+/// inspection subcommands stay unprompted — but only with a pathspec
+/// that can't be read as a flag: `paths` is appended to git's argv with
+/// no `--` separator (teleia-tools:1612), so `paths: ["--output=FILE"]`
+/// makes `git diff` write a file. [`Routing`] decides the question
+/// before any of that: servers name their own tools with no namespacing
+/// (cli/src/mcp.rs:438) and are dispatched ahead of the built-ins, so
+/// without it a server advertising `read` would inherit `read`'s
+/// unprompted pass and run third-party code in the one mode that
+/// promises nothing runs.
 fn plan_gate(name: &str, arguments: &str, routing: Routing) -> PlanGate {
     match routing {
         // Server tool names arrive verbatim from the server's
@@ -872,11 +874,12 @@ impl Agent {
         self.set_pref("mcp_disabled", &joined.join(",")).ok();
     }
 
-    /// Whether an external router (MCP / LSP) owns this tool name.
-    /// Resolved *before* the permission gate in [`Agent::turn`]: the
-    /// answer decides the call's permission class, not merely where it
-    /// dispatches.
-    /// Where a tool name dispatches, and how far plan mode can trust it.
+    /// Where a tool name dispatches, and how far plan mode can trust
+    /// it: [`Agent::is_routed`] first, then — only for a name a router
+    /// owns — that router's own [`ToolRouter::inspects_only`] claim.
+    /// Resolved *before* the permission gate in [`Agent::turn`], because
+    /// the answer decides the call's permission class and not merely
+    /// where it dispatches.
     fn routing(&self, name: &str) -> Routing {
         if !self.is_routed(name) {
             return Routing::Builtin;
@@ -887,6 +890,7 @@ impl Agent {
         }
     }
 
+    /// Whether an external router (MCP / LSP) owns this tool name.
     fn is_routed(&self, name: &str) -> bool {
         !self.shadowed_router_tools.contains(name)
             && !self.is_disabled_router_tool(name)
