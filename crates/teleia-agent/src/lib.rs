@@ -24,12 +24,6 @@ pub trait ToolRouter: Send {
     fn set_disabled_servers(&mut self, _disabled: &BTreeSet<String>) {}
 }
 
-// Filename is capital-F (matches `Fool.md` at the workspace root),
-// but the module identifier stays snake_case so callers keep using
-// `fool::GUIDELINES`.
-#[path = "Fool.rs"]
-mod fool;
-
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TokenCounts {
     pub prompt: u64,
@@ -133,15 +127,15 @@ or outward-facing — a push, a release, a delete outside the worktree — and b
 is the user's to make. Always be concise. When you finish a turn, stop — \
 do not narrate.";
 
-/// Base prompt + the fool-derived guidelines, joined once at startup.
+/// The system turn every session opens with.
 fn system_prompt() -> String {
-    format!("{SYSTEM_PROMPT_BASE}\n\n{}", fool::GUIDELINES)
+    SYSTEM_PROMPT_BASE.to_string()
 }
 
 /// Replace whatever system turn a stored session carries with the
 /// current [`system_prompt`]. Sessions persist message 0 verbatim, so
-/// without this a resumed session keeps the guidelines frozen at the
-/// moment it was created — an edit to `Fool.md` would reach new
+/// without this a resumed session keeps the prompt frozen at the moment
+/// it was created — a change to [`SYSTEM_PROMPT_BASE`] would reach new
 /// sessions only. Retain-then-insert rather than overwriting index 0:
 /// a session whose seq-0 row was skipped as corrupt has no system turn
 /// there, and the providers concatenate every system turn wherever it
@@ -1972,8 +1966,8 @@ mod tests {
 
     #[test]
     fn resuming_re_renders_a_stale_system_prompt() {
-        // A session stored before an edit to Fool.md carries the old text
-        // verbatim; without this the edit would reach new sessions only.
+        // A session stored before a prompt change carries the old text
+        // verbatim; without this the change would reach new sessions only.
         let mut messages = vec![
             Message::System {
                 content: "stale guidelines from an older build".into(),
@@ -2444,22 +2438,6 @@ mod tests {
         // Only once every server offering the name is off does it go.
         agent.disable_mcp("bravo").unwrap();
         assert!(!agent.is_routed("search"));
-    }
-
-    #[test]
-    fn guidelines_quote_the_base_prompt_they_carve_out_of() {
-        // Fool.md ends by calling its suggestion list "the one exception to
-        // \"do not narrate\"" — a quotation of SYSTEM_PROMPT_BASE. Reword
-        // either side and the carve-out silently stops referring to
-        // anything, with nothing else in the tree to catch it.
-        assert!(
-            SYSTEM_PROMPT_BASE.contains("do not narrate"),
-            "base prompt no longer contains the phrase Fool.md quotes"
-        );
-        assert!(
-            fool::GUIDELINES.contains("\"do not narrate\""),
-            "Fool.md no longer quotes the base prompt's phrase"
-        );
     }
 
     #[test]
