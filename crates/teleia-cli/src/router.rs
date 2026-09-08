@@ -35,4 +35,9 @@ impl ToolRouter for CombinedRouter {
             Err(anyhow!("no router handles `{name}`"))
         })
     }
+    fn set_disabled_servers(&mut self, disabled: &std::collections::BTreeSet<String>) {
+        for r in self.routers.iter_mut() {
+            r.set_disabled_servers(disabled);
+        }
+    }
 }

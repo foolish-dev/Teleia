@@ -411,12 +411,17 @@ pub struct McpRegistry {
     /// Surfaced via the `/mcps` panel instead of stderr so loading
     /// stays silent at the terminal level.
     warnings: Vec<String>,
+    /// Server names the user turned off with `/mcps disable`, mirrored
+    /// down from the agent. Consulted at dispatch, which is the only
+    /// place that knows which client a call actually resolves to.
+    disabled: std::collections::BTreeSet<String>,
 }
 
 impl McpRegistry {
     pub fn new() -> Self {
         Self {
             clients: Vec::new(),
+            disabled: std::collections::BTreeSet::new(),
             index: HashMap::new(),
             tools: Vec::new(),
             resources: Vec::new(),
@@ -539,16 +544,21 @@ impl McpRegistry {
     /// a boxed router, so `/mcps enable|disable NAME` can hide / restore
     /// a server's contribution without tearing down its child process.
     pub fn server_tool_defs(&self) -> std::collections::BTreeMap<String, Vec<ToolDef>> {
-        let mut out: std::collections::BTreeMap<String, Vec<ToolDef>> =
-            std::collections::BTreeMap::new();
-        for def in &self.tools {
-            let Some(&idx) = self.index.get(&def.function.name) else {
-                continue;
-            };
-            let server = self.clients[idx].name.clone();
-            out.entry(server).or_default().push(def.clone());
-        }
-        out
+        let names: Vec<&str> = self.clients.iter().map(|c| c.name.as_str()).collect();
+        let has_resources: Vec<bool> = self.resources.iter().map(|rs| !rs.is_empty()).collect();
+        attribute_defs(
+            &self.tools,
+            &self.index,
+            &names,
+            &has_resources,
+            self.read_resource_def().as_ref(),
+        )
+    }
+
+    /// The server `clients[idx]` is. Split out so `dispatch` can name a
+    /// disabled server, and refuse it, before touching its child process.
+    fn server_name(&self, idx: usize) -> &str {
+        &self.clients[idx].name
     }
 }
 
@@ -609,6 +619,89 @@ fn reserved_name_warning(tool: &str) -> Option<String> {
         })
 }
 
+/// Map each server name to the defs it contributed.
+///
+/// Split out of [`McpRegistry::server_tool_defs`] as a pure function over
+/// the pieces, because the agent's whole `/mcps enable|disable` machinery
+/// is keyed on this map and the registry itself cannot be built without
+/// spawning real child processes.
+///
+/// `read_resource` is the synthetic `mcp_read_resource` def. It is not
+/// returned by any server's `tools/list`, so it belongs to no server
+/// naturally — and a def with no server is one `/mcps disable` cannot
+/// reach, which left a disabled server's resources advertised and
+/// readable. Attribute it to every server that actually contributed a
+/// resource, so the agent unroutes it once the last of them is off and
+/// keeps it while any remains on.
+fn attribute_defs(
+    tools: &[ToolDef],
+    index: &HashMap<String, usize>,
+    server_names: &[&str],
+    has_resources: &[bool],
+    read_resource: Option<&ToolDef>,
+) -> std::collections::BTreeMap<String, Vec<ToolDef>> {
+    let mut out: std::collections::BTreeMap<String, Vec<ToolDef>> =
+        std::collections::BTreeMap::new();
+    for def in tools {
+        let Some(&idx) = index.get(&def.function.name) else {
+            continue;
+        };
+        let Some(server) = server_names.get(idx) else {
+            continue;
+        };
+        out.entry((*server).to_string())
+            .or_default()
+            .push(def.clone());
+    }
+    if let Some(def) = read_resource {
+        for (idx, server) in server_names.iter().enumerate() {
+            if has_resources.get(idx).copied().unwrap_or(false) {
+                out.entry((*server).to_string())
+                    .or_default()
+                    .push(def.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The client a `mcp_read_resource` call should go to: the first *enabled*
+/// server advertising `uri`.
+///
+/// The URI, not a tool name, picks the server, so this is the only point
+/// that knows whether the read lands on one the user turned off. Resource
+/// URIs are server-defined strings and nothing dedups them across servers
+/// (`add` pushes each client's list as-is), so two servers with overlapping
+/// roots can both advertise `file:///README.md` — and `mcp_read_resource`
+/// stays routed while any resource server is on (see [`attribute_defs`]).
+/// Taking the first match regardless of state therefore made a perfectly
+/// serviceable read fail, or succeed, purely by config order. Refuse only
+/// when every server holding the URI is off.
+///
+/// A pure function over the pieces, like [`attribute_defs`], because the
+/// registry cannot be built without spawning real child processes.
+fn resource_server(
+    resources: &[Vec<McpResource>],
+    server_names: &[&str],
+    disabled: &std::collections::BTreeSet<String>,
+    uri: &str,
+) -> Result<usize> {
+    let advertises = |i: usize| resources[i].iter().any(|r| r.uri == uri);
+    let off = |i: usize| server_names.get(i).is_some_and(|n| disabled.contains(*n));
+    if let Some(i) = (0..resources.len()).find(|&i| advertises(i) && !off(i)) {
+        return Ok(i);
+    }
+    match (0..resources.len()).find(|&i| advertises(i)) {
+        Some(i) => {
+            let name = server_names[i];
+            Err(anyhow!(
+                "MCP server `{name}` is disabled; run `/mcps enable {name}` to read `{uri}`"
+            ))
+        }
+        None => Err(anyhow!("no MCP server advertises resource `{uri}`")),
+    }
+}
+
 impl ToolRouter for McpRegistry {
     fn definitions(&self) -> Vec<ToolDef> {
         let mut defs = self.tools.clone();
@@ -632,21 +725,35 @@ impl ToolRouter for McpRegistry {
                     .get("uri")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("`{name}` requires a string `uri` argument"))?;
-                // Locate the server that advertised this URI and route
-                // the read through that client.
-                let idx = self
-                    .resources
-                    .iter()
-                    .position(|rs| rs.iter().any(|r| r.uri == uri))
-                    .ok_or_else(|| anyhow!("no MCP server advertises resource `{uri}`"))?;
+                let names: Vec<&str> = self.clients.iter().map(|c| c.name.as_str()).collect();
+                let idx = resource_server(&self.resources, &names, &self.disabled, uri)?;
                 return self.clients[idx].read_resource(uri).await;
             }
             let idx = *self
                 .index
                 .get(name)
                 .ok_or_else(|| anyhow!("MCP tool `{name}` not registered"))?;
+            // Unreachable today, and deliberately kept. When two servers
+            // claim one name, `add` overwrites `index[name]` with the last
+            // of them, so `attribute_defs` files *both* defs under that one
+            // server and none under its peer — which means the agent's
+            // `is_disabled_router_tool` already unroutes the name the
+            // moment that server is off, and a call never arrives here.
+            // The check stays because `index` is the sole authority on
+            // which child process a call reaches: nothing else stands
+            // between a name and a server the user turned off.
+            if self.disabled.contains(self.server_name(idx)) {
+                return Err(anyhow!(
+                    "MCP tool `{name}` resolves to disabled server `{}`; run `/mcps enable {}`",
+                    self.server_name(idx),
+                    self.server_name(idx)
+                ));
+            }
             self.clients[idx].call_tool(name, args).await
         })
+    }
+    fn set_disabled_servers(&mut self, disabled: &std::collections::BTreeSet<String>) {
+        self.disabled = disabled.clone();
     }
 }
 
@@ -811,6 +918,94 @@ mod tests {
         let v = json!({ "unexpected": true });
         let out = flatten_resource_contents(&v);
         assert!(out.contains("unexpected"));
+    }
+
+    #[test]
+    fn attribute_defs_gives_the_synthetic_reader_to_its_resource_servers() {
+        let reader = ToolDef::new(READ_RESOURCE_TOOL, "read", json!({"type": "object"}));
+        let alpha_tool = ToolDef::new("a_tool", "d", json!({"type": "object"}));
+        let bravo_tool = ToolDef::new("b_tool", "d", json!({"type": "object"}));
+        let tools = vec![alpha_tool.clone(), bravo_tool.clone()];
+        let index = HashMap::from([("a_tool".to_string(), 0), ("b_tool".to_string(), 1)]);
+        let names = ["alpha", "bravo", "charlie"];
+
+        // Only bravo and charlie advertise resources, so only they own the
+        // reader — disabling alpha must not take it away.
+        let out = attribute_defs(&tools, &index, &names, &[false, true, true], Some(&reader));
+        let owns = |server: &str| {
+            out.get(server)
+                .map(|d| d.iter().any(|x| x.function.name == READ_RESOURCE_TOOL))
+                .unwrap_or(false)
+        };
+        assert!(!owns("alpha"), "alpha has no resources");
+        assert!(owns("bravo"));
+        assert!(owns("charlie"), "a resources-only server still owns it");
+        assert!(out["alpha"].iter().any(|d| d.function.name == "a_tool"));
+
+        // With no resources anywhere there is no reader to attribute.
+        let out = attribute_defs(&tools, &index, &names, &[false, false, false], None);
+        assert!(out
+            .values()
+            .flatten()
+            .all(|d| d.function.name != READ_RESOURCE_TOOL));
+    }
+
+    #[test]
+    fn resource_read_prefers_an_enabled_server_over_config_order() {
+        let res = |uri: &str| {
+            vec![McpResource {
+                uri: uri.to_string(),
+                name: None,
+                description: None,
+                mime_type: None,
+            }]
+        };
+        // `docs` and `wiki` both advertise the same URI — legal, since
+        // nothing namespaces or dedups resource URIs across servers.
+        let resources = vec![res("file:///README.md"), res("file:///README.md")];
+        let names = ["docs", "wiki"];
+        let off = |n: &str| std::collections::BTreeSet::from([n.to_string()]);
+        let none = std::collections::BTreeSet::new();
+
+        // Nothing disabled: config order decides, as before.
+        assert_eq!(
+            resource_server(&resources, &names, &none, "file:///README.md").unwrap(),
+            0
+        );
+
+        // `docs` off: the read must fall through to `wiki` rather than dying
+        // on a server the user turned off and that nothing else needed.
+        assert_eq!(
+            resource_server(&resources, &names, &off("docs"), "file:///README.md").unwrap(),
+            1
+        );
+        // ...and symmetrically, so the answer never depends on spawn order.
+        assert_eq!(
+            resource_server(&resources, &names, &off("wiki"), "file:///README.md").unwrap(),
+            0
+        );
+
+        // Every holder off: refuse, and name one the user can re-enable.
+        let both = std::collections::BTreeSet::from(["docs".to_string(), "wiki".to_string()]);
+        let err = resource_server(&resources, &names, &both, "file:///README.md")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is disabled"), "{err}");
+        assert!(err.contains("/mcps enable docs"), "{err}");
+
+        // A URI a disabled server holds alone still reports the disable
+        // rather than "no server advertises it" — the user can act on it.
+        let solo = vec![res("file:///only.md"), res("file:///other.md")];
+        let err = resource_server(&solo, &names, &off("docs"), "file:///only.md")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/mcps enable docs"), "{err}");
+
+        // An unknown URI is still an unknown URI.
+        let err = resource_server(&resources, &names, &none, "file:///nope.md")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no MCP server advertises"), "{err}");
     }
 
     #[test]

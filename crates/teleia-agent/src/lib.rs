@@ -13,6 +13,15 @@ pub trait ToolRouter: Send {
     fn definitions(&self) -> Vec<ToolDef>;
     fn handles(&self, name: &str) -> bool;
     fn dispatch<'a>(&'a mut self, name: &'a str, args: &'a str) -> BoxFuture<'a, Result<String>>;
+    /// Servers the user has turned off with `/mcps disable`. Hiding a
+    /// server's defs from the catalogue is not enough on its own: a tool
+    /// name can be claimed by two servers (so the name stays routed while
+    /// either is on, but `dispatch` resolves it to exactly one), and the
+    /// synthetic `mcp_read_resource` reaches a server by URI without going
+    /// through a per-server def at all. Both land on a disabled server's
+    /// child process unless the router itself refuses. Default: a no-op,
+    /// for routers with no notion of a server.
+    fn set_disabled_servers(&mut self, _disabled: &BTreeSet<String>) {}
 }
 
 // Filename is capital-F (matches `Fool.md` at the workspace root),
@@ -702,6 +711,10 @@ impl Agent {
             }
         }
         self.router = Some(router);
+        // A router attached after `set_mcp_servers` (or after a restored
+        // `mcp_disabled` pref) would otherwise start out believing every
+        // server is live.
+        self.sync_disabled_to_router();
     }
 
     /// Record which tool defs came from which MCP server, and apply any
@@ -721,6 +734,18 @@ impl Agent {
                 self.hide_mcp_tools(&name);
                 self.mcp_disabled.insert(name);
             }
+        }
+        self.sync_disabled_to_router();
+    }
+
+    /// Mirror `mcp_disabled` into the router so it can refuse a dispatch
+    /// that would reach a disabled server — see
+    /// [`ToolRouter::set_disabled_servers`]. Call after every change to
+    /// the set.
+    fn sync_disabled_to_router(&mut self) {
+        let disabled = self.mcp_disabled.clone();
+        if let Some(r) = self.router.as_mut() {
+            r.set_disabled_servers(&disabled);
         }
     }
 
@@ -747,6 +772,7 @@ impl Agent {
             return Ok(false);
         }
         self.show_mcp_tools(name);
+        self.sync_disabled_to_router();
         self.persist_mcp_disabled();
         Ok(true)
     }
@@ -759,6 +785,7 @@ impl Agent {
             return Ok(false);
         }
         self.hide_mcp_tools(name);
+        self.sync_disabled_to_router();
         self.persist_mcp_disabled();
         Ok(true)
     }
@@ -2268,6 +2295,68 @@ mod tests {
         );
         agent.enable_mcp("git").unwrap();
         assert!(agent.is_routed("git_log"), "re-enabling must restore it");
+    }
+
+    /// A router that records the disabled set the agent pushes down, so a
+    /// test can observe plumbing that otherwise vanishes into a `Box<dyn>`.
+    struct RecordingRouter(std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>);
+
+    impl ToolRouter for RecordingRouter {
+        fn definitions(&self) -> Vec<ToolDef> {
+            vec![fake_def(RESOURCE_TOOL)]
+        }
+        fn handles(&self, name: &str) -> bool {
+            name == RESOURCE_TOOL
+        }
+        fn dispatch<'a>(
+            &'a mut self,
+            _name: &'a str,
+            _args: &'a str,
+        ) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async { Ok("resource".to_string()) })
+        }
+        fn set_disabled_servers(&mut self, disabled: &BTreeSet<String>) {
+            *self.0.lock().unwrap() = disabled.clone();
+        }
+    }
+
+    /// Stand-in for cli::mcp::READ_RESOURCE_TOOL, which this crate can't see.
+    const RESOURCE_TOOL: &str = "mcp_read_resource";
+
+    #[test]
+    fn disabling_a_resource_server_unroutes_the_synthetic_reader() {
+        // `mcp_read_resource` is synthesised by the registry, not returned
+        // by any server's tools/list. The registry now attributes it to
+        // each resource-bearing server, which is what lets the agent's
+        // hide/unroute machinery reach it at all — without that, disabling
+        // the only server with resources left them readable.
+        let mut agent = fake_agent();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+        agent.set_tool_router(Box::new(RecordingRouter(seen.clone())));
+        let mut servers = BTreeMap::new();
+        servers.insert("docs".to_string(), vec![fake_def(RESOURCE_TOOL)]);
+        agent.set_mcp_servers(servers);
+        assert!(agent.is_routed(RESOURCE_TOOL));
+
+        agent.disable_mcp("docs").unwrap();
+        assert!(
+            !agent.is_routed(RESOURCE_TOOL),
+            "a disabled server's resources must stop being readable"
+        );
+        assert!(
+            !agent
+                .tools()
+                .iter()
+                .any(|d| d.function.name == RESOURCE_TOOL),
+            "the reader must leave the advertised catalogue too"
+        );
+        // And the router itself is told, so a dispatch that resolves by URI
+        // rather than by tool name still refuses.
+        assert_eq!(*seen.lock().unwrap(), BTreeSet::from(["docs".to_string()]));
+
+        agent.enable_mcp("docs").unwrap();
+        assert!(agent.is_routed(RESOURCE_TOOL));
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[test]
