@@ -8,7 +8,7 @@
 #   PREFIX=/usr/local/bin   # default: $HOME/.local/bin
 #   TAG=v0.2.0              # pin a release tag (default: latest)
 #   FROM_SOURCE=1           # skip prebuilt download; cargo build instead
-#   BRANCH=main             # source-build branch (default: dev)
+#   BRANCH=v0.1.0           # source-build branch or tag (default: dev)
 #   NO_PATH=1               # don't touch the shell rc
 #   NO_OLLAMA_HINT=1        # suppress the post-install Ollama nudge
 #   AUTO_INSTALL=1          # bootstrap missing build deps (rustup) without prompting
