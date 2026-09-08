@@ -2958,6 +2958,30 @@ async fn run_compact<B: ratatui::backend::Backend>(
     }
 }
 
+/// Whether `env_var` is the key for the provider the live `LlmClient` is
+/// actually dialling — i.e. whether a key entered for it is the one that
+/// client should be carrying.
+///
+/// Matched on `base_url`, not on the model name, because `set_model` stores
+/// the name with its `provider:` selector stripped
+/// (`LlmClient::set_model` → `resolve_model_name`). Re-deriving a provider
+/// from what `model()` reads back gets it wrong in both directions:
+/// `groq:llama-3.3-70b-versatile` becomes `llama-3.3-70b-versatile`, which
+/// matches no provider and so refused the Groq key the `/model` prompt had
+/// just asked for; and `groq:deepseek-r1-distill-llama-70b` becomes
+/// `deepseek-r1-distill-llama-70b`, which prefix-matches DeepSeek and so
+/// would put a DeepSeek key on the wire to Groq. Both names ship in
+/// `KNOWN_CLOUD_MODELS`. `PROVIDERS` holds each `base_url` and each
+/// `env_var` exactly once, so one `any` is enough.
+///
+/// False for Ollama and for a `--base-url` / `[llms.*]` endpoint no
+/// provider claims: nothing in the table is that endpoint's key.
+fn key_serves_endpoint(base_url: &str, env_var: &str) -> bool {
+    teleia_llm::PROVIDERS
+        .iter()
+        .any(|p| p.env_var == env_var && p.base_url == base_url)
+}
+
 /// Hidden-input key-entry dispatch. Active only while
 /// `state.pending_key_entry` is `Some`. Enter commits the typed key
 /// onto the agent (and updates the `/keys` mirror); Esc cancels.
@@ -2979,11 +3003,26 @@ fn handle_key_entry(state: &mut State, agent: &mut Agent, key: KeyEvent) {
                     let chars = ke.buf.chars().count();
                     let pref = crate::pref_key_for(&ke.env_var);
                     set_pref_warn(state, agent, &pref, &ke.buf);
-                    agent.set_api_key(Some(ke.buf));
-                    state.push(Entry::Info(format!(
-                        "stored {} key ({chars} chars) — saved for future launches too",
-                        ke.provider
-                    )));
+                    // Only the provider the session is actually talking to
+                    // may have its key installed on the live client. The
+                    // `/model` prompt always names that provider, but `/key
+                    // PROVIDER` names any of them — so installing
+                    // unconditionally would put e.g. a Groq secret in the
+                    // Authorization header of the next request to Anthropic,
+                    // and 401 the session until restart. The pref above still
+                    // saves it for the launch or `/model` that selects it.
+                    if key_serves_endpoint(agent.base_url(), &ke.env_var) {
+                        agent.set_api_key(Some(ke.buf));
+                        state.push(Entry::Info(format!(
+                            "stored {} key ({chars} chars) — saved for future launches too",
+                            ke.provider
+                        )));
+                    } else {
+                        state.push(Entry::Info(format!(
+                            "stored {} key ({chars} chars) — saved, but {} isn't the active model's provider, so it takes effect on /model or next launch",
+                            ke.provider, ke.provider
+                        )));
+                    }
                 }
             }
         }
@@ -3139,6 +3178,21 @@ fn handle_slash(state: &mut State, agent: &mut Agent, cmd: &str) {
                 // dismisses without touching it. Ollama models skip
                 // this — no provider, no key needed.
                 if let Some(prov) = teleia_llm::provider_for_model(arg) {
+                    // `set_model` re-reads the key from the process env
+                    // only (`detect_endpoint`), so a key saved by `/key` or
+                    // by the launch prompt — which go to prefs, since
+                    // nothing here calls `env::set_var` — is dropped on
+                    // every switch. Only startup consulted prefs, so
+                    // `/key OpenAI` then `/model gpt-4o` re-prompted for a
+                    // key the user had just been told was stored.
+                    if !agent.has_api_key() {
+                        if let Some(k) = agent
+                            .get_pref(&crate::pref_key_for(prov.env_var))
+                            .filter(|v| !v.is_empty())
+                        {
+                            agent.set_api_key(Some(k));
+                        }
+                    }
                     state.pending_key_entry = Some(KeyEntry {
                         provider: prov.name.to_string(),
                         env_var: prov.env_var.to_string(),
@@ -6082,6 +6136,73 @@ mod tests {
         s.input = "untouched".to_string();
         insert_paste(&mut s, "nope");
         assert_eq!(s.input, "untouched");
+    }
+
+    /// The endpoint `set_model(name)` leaves the client on, so the test
+    /// exercises the same value `handle_key_entry` reads from
+    /// `agent.base_url()` rather than a hand-written URL.
+    fn endpoint_for(model: &str) -> String {
+        let mut llm = teleia_llm::LlmClient::new("http://localhost:11434/v1", "seed");
+        llm.set_model(model.to_string());
+        llm.base_url().to_string()
+    }
+
+    #[test]
+    fn key_entry_only_arms_the_live_client_for_the_active_endpoint() {
+        // `/model` opens the key prompt for the provider it just switched
+        // to, so the typed key is the one the live client should carry.
+        assert!(key_serves_endpoint(
+            &endpoint_for("claude-fable-5"),
+            "ANTHROPIC_API_KEY"
+        ));
+        assert!(key_serves_endpoint(
+            &endpoint_for("gpt-4o"),
+            "OPENAI_API_KEY"
+        ));
+
+        // A `provider:` selector is the case a model-name check cannot get
+        // right: `set_model` stores the name stripped, so `agent.model()`
+        // reads back `llama-3.3-70b-versatile` — which routes nowhere, and
+        // so refused the Groq key the prompt had just asked for, 401ing the
+        // session until restart. Both names below are in KNOWN_CLOUD_MODELS.
+        assert!(key_serves_endpoint(
+            &endpoint_for("groq:llama-3.3-70b-versatile"),
+            "GROQ_API_KEY"
+        ));
+        assert!(key_serves_endpoint(
+            &endpoint_for("openrouter:anthropic/claude-opus-4-7"),
+            "OPENROUTER_API_KEY"
+        ));
+
+        // And the same stripping fails open the other way: the stripped
+        // `deepseek-r1-distill-llama-70b` prefix-matches DeepSeek while the
+        // client is pointed at Groq, which would send a DeepSeek secret to
+        // api.groq.com.
+        assert!(!key_serves_endpoint(
+            &endpoint_for("groq:deepseek-r1-distill-llama-70b"),
+            "DEEPSEEK_API_KEY"
+        ));
+
+        // `/key PROVIDER` names any provider at all. Installing that key on
+        // the live client would put a Groq secret in the Authorization
+        // header of the next request to Anthropic — and 401 the session
+        // until restart. It is saved to prefs either way; it just must not
+        // go on the wire to someone else.
+        assert!(!key_serves_endpoint(
+            &endpoint_for("claude-fable-5"),
+            "GROQ_API_KEY"
+        ));
+        assert!(!key_serves_endpoint(
+            &endpoint_for("gpt-4o"),
+            "ANTHROPIC_API_KEY"
+        ));
+
+        // A local Ollama model has no provider and needs no key, so nothing
+        // a user types at the prompt belongs on its client either.
+        assert!(!key_serves_endpoint(
+            &endpoint_for("hf.co/FoolDev/Thanatos-27B-HERETIC"),
+            "ANTHROPIC_API_KEY"
+        ));
     }
 
     #[test]

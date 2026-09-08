@@ -1145,6 +1145,14 @@ impl Agent {
         self.llm.model()
     }
 
+    /// The endpoint the client is actually dialling. `model()` is not a
+    /// substitute: `set_model` stores the name with its `provider:`
+    /// selector stripped, so `groq:llama-3.3-70b-versatile` reads back as
+    /// `llama-3.3-70b-versatile` — a name no longer routable to Groq.
+    pub fn base_url(&self) -> &str {
+        self.llm.base_url()
+    }
+
     pub fn set_model(&mut self, model: String) {
         self.llm.set_model(model);
     }
