@@ -30,8 +30,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use teleia_agent::ToolRouter;
 use teleia_llm::ToolDef;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 
 use crate::config::LspEntry;
 
@@ -99,13 +99,25 @@ struct Diagnostic {
     source: Option<String>,
 }
 
+/// The client's write and read halves, boxed rather than tied to
+/// `ChildStdin`/`ChildStdout`. Every wire method, the Content-Length
+/// framing, the request timeout and the desync poison are otherwise
+/// reachable only by spawning a real language server — which is why they
+/// were the least-tested code in this file and where its two worst bugs
+/// lived. With these boxed, a test drives the same code over
+/// `tokio::io::duplex`.
+type Sink = Box<dyn AsyncWrite + Send + Unpin>;
+type Source = Box<dyn AsyncRead + Send + Unpin>;
+
 pub struct LspClient {
     pub name: String,
     pub server_name: Option<String>,
     pub server_version: Option<String>,
-    child: tokio::process::Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// `None` when the streams are in-memory. The real client owns the
+    /// child so `kill_on_drop` fires when the registry drops it.
+    child: Option<tokio::process::Child>,
+    stdin: Sink,
+    stdout: BufReader<Source>,
     next_id: u64,
     /// URIs the agent has pushed a `didOpen` for. A re-query bumps the
     /// version and pushes a `didChange` with the current on-disk text, so
@@ -177,7 +189,24 @@ impl LspClient {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("LSP `{name}` exposed no stdout"))?;
-        let mut client = Self {
+        let mut client = Self::over(name, Box::new(stdin), Box::new(stdout), Some(child));
+        // Bound the handshake: a server that spawns but never answers
+        // `initialize` (or stays stdout-silent) would otherwise hang boot
+        // indefinitely, since spawn_all awaits each spawn serially. On
+        // timeout the error flows into spawn_all's warnings, demoting a
+        // boot hang to a `/lsps` warning.
+        tokio::time::timeout(std::time::Duration::from_secs(10), client.initialize())
+            .await
+            .map_err(|_| anyhow!("LSP `{name}` handshake timed out after 10s"))??;
+        Ok(client)
+    }
+
+    /// Wire a client to an already-open pair of streams. `spawn` passes a
+    /// child process's stdio; tests pass the two halves of an in-memory
+    /// pipe. Nothing else differs — the same framing and the same request
+    /// path run either way.
+    fn over(name: &str, stdin: Sink, stdout: Source, child: Option<tokio::process::Child>) -> Self {
+        Self {
             name: name.to_string(),
             server_name: None,
             server_version: None,
@@ -190,16 +219,7 @@ impl LspClient {
             supports_definition: false,
             supports_references: false,
             supports_workspace_symbol: false,
-        };
-        // Bound the handshake: a server that spawns but never answers
-        // `initialize` (or stays stdout-silent) would otherwise hang boot
-        // indefinitely, since spawn_all awaits each spawn serially. On
-        // timeout the error flows into spawn_all's warnings, demoting a
-        // boot hang to a `/lsps` warning.
-        tokio::time::timeout(std::time::Duration::from_secs(10), client.initialize())
-            .await
-            .map_err(|_| anyhow!("LSP `{name}` handshake timed out after 10s"))??;
-        Ok(client)
+        }
     }
 
     async fn initialize(&mut self) -> Result<()> {
@@ -694,7 +714,9 @@ fn is_response_to(msg: &Value, id: u64) -> bool {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
     }
 }
 
@@ -2459,6 +2481,297 @@ mod tests {
         for name in LSP_TOOLS {
             assert!(!reg.handles(name), "{name}");
         }
+    }
+
+    // ---- wire-level tests ------------------------------------------
+    //
+    // These drive the real `LspClient` over an in-memory pipe. Everything
+    // below the fan-outs — the framing, the request loop, the timeout,
+    // the desync poison, the capability gating — used to be reachable
+    // only by spawning a real language server, which is why it went
+    // untested and why this file's two worst bugs lived there.
+
+    /// Wire a client to one half of an in-memory pipe, handing back the
+    /// other half for the test to act as the server on.
+    fn wired(name: &str) -> (LspClient, tokio::io::DuplexStream) {
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        let (r, w) = tokio::io::split(client_side);
+        (
+            LspClient::over(name, Box::new(w), Box::new(r), None),
+            server_side,
+        )
+    }
+
+    /// Read one Content-Length-framed message off the server side.
+    async fn recv(s: &mut tokio::io::DuplexStream) -> Value {
+        let mut header = Vec::new();
+        loop {
+            let mut b = [0u8; 1];
+            s.read_exact(&mut b).await.expect("header byte");
+            header.push(b[0]);
+            if header.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let len: usize = String::from_utf8(header)
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length:"))
+            .expect("Content-Length header")
+            .trim()
+            .parse()
+            .unwrap();
+        let mut body = vec![0u8; len];
+        s.read_exact(&mut body).await.expect("body");
+        serde_json::from_slice(&body).expect("json body")
+    }
+
+    /// Write one framed message to the client.
+    async fn send(s: &mut tokio::io::DuplexStream, v: &Value) {
+        let body = serde_json::to_vec(v).unwrap();
+        s.write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+            .await
+            .unwrap();
+        s.write_all(&body).await.unwrap();
+        s.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_server_error_response_leaves_the_client_usable() {
+        // The distinction the whole desync poison turns on: an error
+        // response means a *complete frame* arrived, so the stream is
+        // intact even though the call failed. Treating it as a transport
+        // failure would retire a healthy server on its first
+        // method-not-found — which is the normal answer from a server
+        // that simply doesn't implement the request.
+        let (mut client, mut server) = wired("rust");
+        client.supports_definition = true;
+        let task = tokio::spawn(async move {
+            let req = recv(&mut server).await;
+            send(
+                &mut server,
+                &json!({
+                    "jsonrpc": "2.0", "id": req["id"],
+                    "error": { "code": -32601, "message": "method not found" }
+                }),
+            )
+            .await;
+            server
+        });
+        let err = client
+            .definition("file:///a.rs", 0, 0)
+            .await
+            .expect_err("an error response is still an error");
+        assert!(format!("{err:#}").contains("method not found"), "{err:#}");
+        assert!(
+            client.usable(),
+            "an error response must not poison the stream"
+        );
+        let _ = task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_request_poisons_the_client() {
+        // Esc / Ctrl-C drops the whole turn future mid-request. The read
+        // is not cancel-safe: bytes already consumed are gone, and the
+        // rest of that frame would be parsed as the next one's headers.
+        // Nothing written after the await ever runs, which is exactly why
+        // the flag is set before it.
+        let (mut client, _server) = wired("rust");
+        client.supports_references = true;
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.references("file:///a.rs", 0, 0),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the server never answered");
+        assert!(!client.usable(), "an abandoned read must poison the client");
+
+        // And every later call refuses up front rather than reading a
+        // frame out of the middle of the abandoned one.
+        let err = client
+            .references("file:///a.rs", 0, 0)
+            .await
+            .expect_err("a poisoned client answers nothing");
+        assert!(format!("{err:#}").contains("out of sync"), "{err:#}");
+        // A notification is refused too — nothing drains this server's
+        // stdout now, so a `didOpen` would only fill a pipe.
+        assert!(client
+            .notify("textDocument/didOpen", json!({}))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_capability_the_server_did_not_advertise_is_never_requested() {
+        // `supports_*` default to false, so the client answers locally
+        // rather than pay a round trip. No server task is running here:
+        // if any of these actually wrote a request, the test would hang.
+        let (mut client, _server) = wired("rust");
+        assert!(client
+            .definition("file:///a.rs", 0, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(client
+            .references("file:///a.rs", 0, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(client.workspace_symbols("foo").await.unwrap().is_empty());
+        assert!(client.usable(), "declining locally poisons nothing");
+    }
+
+    #[tokio::test]
+    async fn initialize_records_what_the_server_can_answer() {
+        let (mut client, mut server) = wired("rust");
+        let task = tokio::spawn(async move {
+            let req = recv(&mut server).await;
+            assert_eq!(req["method"], "initialize");
+            send(
+                &mut server,
+                &json!({
+                    "jsonrpc": "2.0", "id": req["id"],
+                    "result": {
+                        "serverInfo": { "name": "fake-analyzer", "version": "1.2.3" },
+                        "capabilities": {
+                            "definitionProvider": true,
+                            // An options object is an affirmative…
+                            "workspaceSymbolProvider": { "workDoneProgress": true },
+                            // …and only an explicit false is a refusal.
+                            "referencesProvider": false
+                        }
+                    }
+                }),
+            )
+            .await;
+            recv(&mut server).await
+        });
+        client.initialize().await.expect("handshake");
+        let notif = task.await.unwrap();
+        assert_eq!(notif["method"], "initialized");
+        assert_eq!(client.server_name.as_deref(), Some("fake-analyzer"));
+        assert_eq!(client.server_version.as_deref(), Some("1.2.3"));
+        assert!(client.supports_definition);
+        assert!(client.supports_workspace_symbol);
+        assert!(!client.supports_references);
+    }
+
+    #[tokio::test]
+    async fn a_serverinfo_we_cannot_parse_does_not_cost_the_capabilities() {
+        // `serverInfo` is decoration for the `/lsps` panel. Reading it
+        // through the same deserialise as the capabilities meant one
+        // server sending an unexpected shape for `name` silently disabled
+        // all three tools for it.
+        let (mut client, mut server) = wired("rust");
+        let task = tokio::spawn(async move {
+            let req = recv(&mut server).await;
+            send(
+                &mut server,
+                &json!({
+                    "jsonrpc": "2.0", "id": req["id"],
+                    "result": {
+                        "serverInfo": { "name": 42 },
+                        "capabilities": { "definitionProvider": true }
+                    }
+                }),
+            )
+            .await;
+            recv(&mut server).await
+        });
+        client.initialize().await.expect("handshake");
+        let _ = task.await.unwrap();
+        assert_eq!(client.server_name, None, "unparseable, so not shown");
+        assert!(
+            client.supports_definition,
+            "a decorative field must not disable a capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn chatter_before_the_response_does_not_derail_the_request() {
+        // Servers emit progress notifications, and their own requests,
+        // while they work. A notification is ignored; a request must be
+        // answered or a server that blocks on our reply deadlocks the
+        // turn.
+        let (mut client, mut server) = wired("rust");
+        client.supports_workspace_symbol = true;
+        let task = tokio::spawn(async move {
+            let req = recv(&mut server).await;
+            send(
+                &mut server,
+                &json!({ "jsonrpc": "2.0", "method": "window/logMessage", "params": {} }),
+            )
+            .await;
+            send(
+                &mut server,
+                &json!({ "jsonrpc": "2.0", "id": 9001, "method": "workspace/configuration" }),
+            )
+            .await;
+            let reply = recv(&mut server).await;
+            send(
+                &mut server,
+                &json!({ "jsonrpc": "2.0", "id": req["id"], "result": [] }),
+            )
+            .await;
+            reply
+        });
+        let hits = client.workspace_symbols("foo").await.unwrap();
+        let reply = task.await.unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(reply["id"], json!(9001));
+        assert_eq!(reply["error"]["code"], json!(-32601));
+        assert!(client.usable());
+    }
+
+    #[tokio::test]
+    async fn a_location_link_answer_is_normalised_off_the_wire() {
+        // End to end: 0-based wire position out, `LocationLink` back, and
+        // the identifier range preferred over the whole item's range.
+        let (mut client, mut server) = wired("rust");
+        client.supports_definition = true;
+        let task = tokio::spawn(async move {
+            let req = recv(&mut server).await;
+            assert_eq!(req["method"], "textDocument/definition");
+            assert_eq!(req["params"]["position"]["line"], 41);
+            assert_eq!(req["params"]["position"]["character"], 3);
+            send(
+                &mut server,
+                &json!({
+                    "jsonrpc": "2.0", "id": req["id"],
+                    "result": [{
+                        "targetUri": "file:///b.rs",
+                        "targetRange": { "start": { "line": 9, "character": 0 } },
+                        "targetSelectionRange": { "start": { "line": 11, "character": 7 } }
+                    }]
+                }),
+            )
+            .await;
+        });
+        let locs = client.definition("file:///a.rs", 41, 3).await.unwrap();
+        task.await.unwrap();
+        assert_eq!(locs, vec![loc("file:///b.rs", 11, 7)]);
+    }
+
+    #[tokio::test]
+    async fn references_always_sends_the_context_object() {
+        // The `context` object is mandatory in the spec and not defaulted
+        // consistently: some servers reject the request without it,
+        // others silently read it as `includeDeclaration: false`.
+        let (mut client, mut server) = wired("rust");
+        client.supports_references = true;
+        let task = tokio::spawn(async move {
+            let req = recv(&mut server).await;
+            send(
+                &mut server,
+                &json!({ "jsonrpc": "2.0", "id": req["id"], "result": [] }),
+            )
+            .await;
+            req
+        });
+        client.references("file:///a.rs", 0, 0).await.unwrap();
+        let req = task.await.unwrap();
+        assert_eq!(req["params"]["context"]["includeDeclaration"], json!(true));
     }
 
     #[test]
