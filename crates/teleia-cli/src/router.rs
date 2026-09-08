@@ -40,4 +40,66 @@ impl ToolRouter for CombinedRouter {
             r.set_disabled_servers(disabled);
         }
     }
+    /// Ask the same router `dispatch` would pick — the first to claim the
+    /// name. Asking any other one would let a permissive router vouch for
+    /// a name a different router actually runs.
+    fn inspects_only(&self, name: &str) -> bool {
+        self.routers
+            .iter()
+            .find(|r| r.handles(name))
+            .is_some_and(|r| r.inspects_only(name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Fake {
+        name: &'static str,
+        inspects: bool,
+    }
+
+    impl ToolRouter for Fake {
+        fn definitions(&self) -> Vec<ToolDef> {
+            vec![ToolDef::new(self.name, "d", json!({ "type": "object" }))]
+        }
+        fn handles(&self, name: &str) -> bool {
+            name == self.name
+        }
+        fn dispatch<'a>(&'a mut self, _n: &'a str, _a: &'a str) -> BoxFuture<'a, Result<String>> {
+            let who = self.name;
+            Box::pin(async move { Ok(who.to_string()) })
+        }
+        fn inspects_only(&self, _name: &str) -> bool {
+            self.inspects
+        }
+    }
+
+    fn combined(first: bool, second: bool) -> CombinedRouter {
+        CombinedRouter::new(vec![
+            Box::new(Fake {
+                name: "t",
+                inspects: first,
+            }),
+            Box::new(Fake {
+                name: "t",
+                inspects: second,
+            }),
+        ])
+    }
+
+    #[test]
+    fn inspects_only_asks_the_router_that_would_run_the_call() {
+        // Two routers can claim one name; `dispatch` runs the first, so
+        // the read-only claim has to come from the first too. Polling
+        // until one says yes would let a permissive router vouch for a
+        // call a different router actually runs — and plan mode runs an
+        // inspecting call without asking anyone.
+        assert!(!combined(false, true).inspects_only("t"));
+        assert!(combined(true, false).inspects_only("t"));
+        // A name no router claims is nobody's to vouch for.
+        assert!(!combined(true, true).inspects_only("other"));
+    }
 }

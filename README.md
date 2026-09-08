@@ -84,7 +84,7 @@ Three stances control tool execution — cycle with `Shift+Tab` or set explicitl
 
 | mode      | chip    | behaviour                                                                  | trigger              |
 | --------- | ------- | -------------------------------------------------------------------------- | -------------------- |
-| **PLAN**  | blue    | only inspection built-ins run unprompted — filesystem reads, search, metadata, `sha256`, `diff` (plus `git`'s `status` / `diff` / `log` with non-flag paths); `fetch`, `web_search`, `env`, `lint`, `typecheck` and `test` prompt `y`/`n`/`a` because they reach the network or compile the working tree; every mutating tool, and every MCP or LSP tool regardless of its name, short-circuits with a synthetic "blocked: plan mode" result | `/plan`, `--plan`    |
+| **PLAN**  | blue    | only inspection built-ins run unprompted — filesystem reads, search, metadata, `sha256`, `diff` (plus `git`'s `status` / `diff` / `log` with non-flag paths); `fetch`, `web_search`, `env`, `lint`, `typecheck` and `test` prompt `y`/`n`/`a` because they reach the network or compile the working tree; the `lsp_*` queries run unprompted too, since a router may declare a name it owns read-only; every mutating tool, and every MCP tool regardless of its name, short-circuits with a synthetic "blocked: plan mode" result | `/plan`, `--plan`    |
 | **BUILD** | green (default) | every tool call pauses for `y` allow / `n` deny / `a` allow-all (auto)                          | `/build`, default    |
 | **AUTO**  | red     | every tool dispatches immediately, no prompts                              | `/auto`, `--auto`    |
 

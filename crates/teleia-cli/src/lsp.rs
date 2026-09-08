@@ -1627,6 +1627,12 @@ impl ToolRouter for LspRegistry {
     fn handles(&self, name: &str) -> bool {
         LSP_TOOLS.contains(&name) && !self.clients.is_empty()
     }
+    /// Every `lsp_*` tool is a query. They ask a language server about
+    /// code it has already indexed — no write, no execution, no network —
+    /// so plan mode runs them unprompted, like `read` and `grep`.
+    fn inspects_only(&self, name: &str) -> bool {
+        LSP_TOOLS.contains(&name)
+    }
     fn dispatch<'a>(&'a mut self, name: &'a str, args: &'a str) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let v: Value = serde_json::from_str(args)
@@ -2255,6 +2261,21 @@ mod tests {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(root_matches(crate_dir, &["*.lock".into()]));
         assert!(!root_matches(crate_dir, &["*.nope-xyz".into()]));
+    }
+
+    #[test]
+    fn every_lsp_tool_declares_itself_read_only() {
+        // Plan mode runs these unprompted on the strength of this claim,
+        // so a tool added to LSP_TOOLS that is not a pure query has to
+        // change this too rather than inherit the pass.
+        let reg = LspRegistry {
+            clients: Vec::new(),
+            warnings: Vec::new(),
+        };
+        for name in LSP_TOOLS {
+            assert!(reg.inspects_only(name), "{name}");
+        }
+        assert!(!reg.inspects_only("bash"));
     }
 
     #[test]
