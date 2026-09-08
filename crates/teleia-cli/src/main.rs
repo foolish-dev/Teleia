@@ -562,10 +562,27 @@ async fn main() -> Result<()> {
     // LSP servers: initialize handshake + expose the `lsp_*` tools.
     // The registry is folded into the agent's tool router below
     // (alongside MCP) so the children stay alive for the whole run.
-    let lsp_registry: Option<lsp::LspRegistry> = if cfg.lsps.is_empty() {
+    //
+    // `root_patterns` gates which ones start: booting rust-analyzer in a
+    // Python checkout costs seconds and a few hundred MB to produce
+    // nothing. An entry with no patterns still starts anywhere, which is
+    // what an unset key has always meant.
+    let lsp_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let lsp_skipped: Vec<String> = cfg
+        .lsps
+        .iter()
+        .filter(|(_, e)| !lsp::root_matches(&lsp_root, &e.root_patterns))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let lsp_active: Vec<(&String, &config::LspEntry)> = cfg
+        .lsps
+        .iter()
+        .filter(|(name, _)| !lsp_skipped.contains(name))
+        .collect();
+    let lsp_registry: Option<lsp::LspRegistry> = if lsp_active.is_empty() {
         None
     } else {
-        let reg = lsp::LspRegistry::spawn_all(cfg.lsps.iter(), |name, i, n| {
+        let reg = lsp::LspRegistry::spawn_all(lsp_active, |name, i, n| {
             boot.step(&format!("starting LSP server {i}/{n}: {name}"));
         })
         .await;
@@ -658,7 +675,7 @@ async fn main() -> Result<()> {
             .map(|r| r.warnings().to_vec())
             .unwrap_or_default();
         let running = live.len();
-        let total = cfg.lsps.len();
+        let total = cfg.lsps.len() - lsp_skipped.len();
         let label = if running > 0 {
             "running (lsp_* tools wired)"
         } else {
@@ -680,6 +697,12 @@ async fn main() -> Result<()> {
                 Some((Some(sname), Some(ver))) => format!("  ·  {sname} {ver}"),
                 Some((Some(sname), None)) => format!("  ·  {sname}"),
                 Some(_) => "  ·  running".to_string(),
+                // Say which of the two "not running" this is: a server
+                // deliberately skipped for this project reads as a bug
+                // otherwise, and a failed one reads as intentional.
+                None if lsp_skipped.contains(name) => {
+                    "  ·  skipped (no root pattern matched here)".to_string()
+                }
                 None => "  ·  not running".to_string(),
             };
             text.push_str(&format!("\n  {name}  ·  {cmd}  ·  roots: {roots}{status}"));

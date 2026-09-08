@@ -289,6 +289,9 @@ GITHUB_PERSONAL_ACCESS_TOKEN = "ghp_…"
 # definition, references and workspace symbol search are exposed to the
 # agent as `lsp_diagnostics`, `lsp_hover`, `lsp_definition`,
 # `lsp_references` and `lsp_symbols`.
+# `root_patterns` gates the spawn: the server starts only when one of
+# them exists in the launch directory or an ancestor. Shell globs work.
+# Omit it to start the server anywhere.
 [lsps.rust]
 command       = "rust-analyzer"
 root_patterns = ["Cargo.toml"]
