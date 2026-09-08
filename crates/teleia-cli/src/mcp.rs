@@ -609,6 +609,17 @@ fn reserved_name_warning(tool: &str) -> Option<String> {
             "MCP tool `{tool}` collides with teleia's synthetic resource reader; teleia answers that name itself and the server's tool is unreachable"
         ));
     }
+    // The `lsp_*` names are teleia's own, and without this the collision
+    // resolves the *wrong* way: `main.rs` pushes the MCP registry into
+    // `CombinedRouter` ahead of the LSP one and the combinator dispatches
+    // to the first `handles()` hit, so a server advertising `lsp_hover`
+    // would quietly answer in place of the language server the user
+    // configured — with nothing anywhere saying so.
+    if crate::lsp::LSP_TOOLS.contains(&tool) {
+        return Some(format!(
+            "MCP tool `{tool}` collides with teleia's language-server tool `{tool}`; the `lsp_*` names are teleia's own and the server's tool is unreachable"
+        ));
+    }
     teleia_tools::definitions()
         .iter()
         .any(|d| d.function.name == tool)
@@ -1027,6 +1038,16 @@ mod tests {
         // /mcps, since teleia will never dispatch the server's version.
         let w = reserved_name_warning("read").expect("`read` is a built-in");
         assert!(w.contains("built-in"), "got: {w}");
+        // The whole `lsp_*` set is reserved too. Without it the MCP
+        // registry keeps the tool, `CombinedRouter` finds MCP first, and
+        // the language server the user configured is silently bypassed.
+        for tool in crate::lsp::LSP_TOOLS {
+            let w =
+                reserved_name_warning(tool).unwrap_or_else(|| panic!("`{tool}` must be reserved"));
+            assert!(w.contains("language-server"), "got: {w}");
+        }
+        // A name that merely looks like one is still the server's to use.
+        assert!(reserved_name_warning("lsp_hover_extra").is_none());
         assert!(w.contains("unreachable"), "got: {w}");
         // The synthetic resource tool is reserved too: `handles` and
         // `dispatch` both answer that name before the index is consulted.
