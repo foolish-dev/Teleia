@@ -21,7 +21,10 @@ use ratatui::{
     },
     Terminal,
 };
-use std::{io, time::Duration};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 use teleia_agent::{Agent, PermissionMode, TokenCounts, ToolApproval, TurnEvent, COMPACT_AT_PCT};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -506,7 +509,17 @@ struct State {
     status: String,
     model: String,
     scroll: u16, // offset from auto-scroll bottom; 0 = follow
-    working: bool,
+    /// When the in-flight turn started, `None` while idle. One field
+    /// instead of a `bool` beside an `Instant`: the spinner, the dimmed
+    /// input body and the elapsed timer all read this, so they cannot
+    /// disagree about whether a turn is running.
+    working_since: Option<Instant>,
+    /// When the tool-approval prompt went up, `None` otherwise. The turn
+    /// is parked on a keystroke for as long as it stands, so the wait is
+    /// rolled back out of `working_since` when it clears: build mode
+    /// gates every tool call, and a turn that sat four minutes waiting
+    /// for a `y` did not spend four minutes thinking.
+    awaiting_since: Option<Instant>,
     should_quit: bool,
     frame: usize, // monotonic tick driving the spinner animation
     tokens: TokenCounts,
@@ -695,7 +708,8 @@ impl State {
             ),
             model: model.to_string(),
             scroll: 0,
-            working: false,
+            working_since: None,
+            awaiting_since: None,
             should_quit: false,
             frame: 0,
             tokens: TokenCounts::default(),
@@ -735,6 +749,58 @@ impl State {
             search_pattern: None,
             search_matches: Vec::new(),
             search_idx: None,
+        }
+    }
+
+    /// Start the work clock unless one is already running, reporting
+    /// whether this call owns it. A nested block must not restart it:
+    /// an auto-compaction inside a turn is part of the same prompt,
+    /// which has been in flight since the user hit enter.
+    fn begin_work(&mut self) -> bool {
+        if self.working_since.is_some() {
+            return false;
+        }
+        // Drop a hold left over from a turn that ended with its approval
+        // prompt still standing — the Ctrl-C path at run_turn clears that
+        // prompt precisely because it can. Refunding that span into *this*
+        // turn would start the clock in the future and freeze it at ` 0s`.
+        self.awaiting_since = None;
+        self.working_since = Some(Instant::now());
+        true
+    }
+
+    /// Stop the clock this call started and report how long it ran.
+    /// `owned` is what [`State::begin_work`] returned — a nested block
+    /// passes `false` and leaves the outer clock alone.
+    fn end_work(&mut self, owned: bool) -> Option<Duration> {
+        if !owned {
+            return None;
+        }
+        self.working_since.take().map(|t| t.elapsed())
+    }
+
+    /// Whether a turn is in flight.
+    fn working(&self) -> bool {
+        self.working_since.is_some()
+    }
+
+    /// Stop counting: the turn is now blocked on the user, not working.
+    fn hold_work(&mut self) {
+        self.awaiting_since = Some(Instant::now());
+    }
+
+    /// Resume counting, discarding the time spent waiting on the user by
+    /// pushing the clock's start forward by exactly that span. Idempotent
+    /// — the prompt is cleared from more than one path (a decision key,
+    /// Ctrl-C) and only the first clears the hold.
+    fn resume_work(&mut self) {
+        let Some(waited) = self.awaiting_since.take().map(|t| t.elapsed()) else {
+            return;
+        };
+        // `checked_add` rather than `+`: adding to an `Instant` panics on
+        // overflow, and a lost correction beats a crashed TUI.
+        if let Some(start) = self.working_since {
+            self.working_since = start.checked_add(waited).or(Some(start));
         }
     }
 
@@ -862,6 +928,7 @@ impl State {
                     arguments,
                     responder,
                 });
+                self.hold_work();
                 if self.follow_bottom {
                     self.scroll = 0;
                 }
@@ -1640,6 +1707,30 @@ fn sync_ctx(state: &mut State, agent: &Agent) {
         .map(|budget| (agent.context_estimate().total(), budget));
 }
 
+/// Render a turn's wall-clock for the status bar. Whole seconds under a
+/// minute, then `m s`, then `h m` — a coding turn that runs for hours is
+/// worth reading at a glance, and sub-second precision on a streaming
+/// model is noise. Truncates, so the timer never claims time that has
+/// not elapsed.
+///
+/// Every leading number is right-aligned in two columns, which pins the
+/// field to three characters below a minute and seven at or above one.
+/// The status bar's later segments shift once, at the minute mark, and
+/// never shift back: without the padding the field would also grow at
+/// ten seconds and ten minutes, and *shrink* from `59m 59s` to `1h 00m`.
+/// There is deliberately no day unit — `48h 00m` is clearer than `2d`
+/// for something that is supposed to read as "far too long".
+fn format_elapsed(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs:>2}s")
+    } else if secs < 3600 {
+        format!("{:>2}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{:>2}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 /// Percent of the context budget the estimate fills. Truncates rather than
 /// rounds (84.9% must not read as the 85% compaction alarm), can exceed 100
 /// (the estimate is taken before compaction trims it back under), and a zero
@@ -1689,6 +1780,11 @@ async fn submit_input<B: ratatui::backend::Backend>(
         state.input_history.push(trimmed.to_string());
         agent.push_input_history(trimmed);
     }
+    // How long the work below ran, for the status line. Every branch
+    // that reaches the status line sets it; the plain-slash-command
+    // branch returns before then. `None` only for a compaction that was
+    // interrupted, or one nested inside a turn whose clock it doesn't own.
+    let took;
     if let Some(cmd) = trimmed.strip_prefix('/') {
         handle_slash(state, agent, cmd);
         // `/loop`, `/compact`, `/model` arm pending flags but can't run async
@@ -1699,9 +1795,9 @@ async fn submit_input<B: ratatui::backend::Backend>(
             refresh_local_budget(state, agent).await;
         }
         if let Some(spec) = state.pending_loop.take() {
-            run_loop(terminal, state, agent, spec).await;
+            took = run_loop(terminal, state, agent, spec).await;
         } else if std::mem::take(&mut state.pending_compact) {
-            run_compact(terminal, state, agent).await;
+            took = run_compact(terminal, state, agent).await;
         } else {
             // Plain slash commands (`/context`, `/reset`, `/load`, …) can
             // move the gauge too — sync before the early return.
@@ -1710,16 +1806,27 @@ async fn submit_input<B: ratatui::backend::Backend>(
         }
     } else {
         state.push(Entry::User(trimmed.to_string()));
-        state.working = true;
+        let owned = state.begin_work();
         run_turn_ac(terminal, state, agent, trimmed.to_string()).await;
-        state.working = false;
+        took = state.end_work(owned);
     }
     state.tokens = agent.tokens();
     sync_ctx(state, agent);
-    state.status = format!(
-        "session {} · ready",
-        &agent.session_id()[..agent.session_id().len().min(12)]
-    );
+    let session = &agent.session_id()[..agent.session_id().len().min(12)];
+    // Keep the turn's wall-clock on screen once the live timer stops —
+    // it is most interesting the moment it disappears. The command
+    // paths above (`/loop`, `/compact`) leave `took` unset and read as
+    // before.
+    state.status = match took {
+        // `trim_start`: the pad keeps the *live* field from shifting the
+        // segments beside it, and this line is static prose where it would
+        // only read as a stray double space.
+        Some(d) => format!(
+            "session {session} · {} · ready",
+            format_elapsed(d).trim_start()
+        ),
+        None => format!("session {session} · ready"),
+    };
 
     if state.notify {
         let preview: String = state
@@ -2678,6 +2785,7 @@ async fn run_turn<B: ratatui::backend::Backend>(
                     // it's wedged for the rest of the session. Dropping the
                     // responder denies the abandoned tool call.
                     state.pending_approval = None;
+                    state.resume_work();
                     state.finalize_trailing_stream();
                     state.push(Entry::Info("(interrupted)".into()));
                     return TurnOutcome::Stopped;
@@ -2685,6 +2793,7 @@ async fn run_turn<B: ratatui::backend::Backend>(
                 Event::Key(k) if state.pending_approval.is_some() => {
                     // Single-keystroke gate: y/n/a (Esc = deny).
                     if let Some(decision) = approval_decision(k) {
+                        state.resume_work();
                         if let Some(pa) = state.pending_approval.take() {
                             // Mirrors the agent's `allow_all_promotes`:
                             // allow-all only promotes out of build. The
@@ -2808,7 +2917,9 @@ async fn run_turn_ac<B: ratatui::backend::Backend>(
     // overflows, instead of waiting for an error that never arrives.
     if state.auto_compact && agent.should_compact() {
         let before = agent.session_id().to_string();
-        run_compact(terminal, state, agent).await;
+        // Nested: `run_compact` reports `None` and the enclosing turn's
+        // clock keeps running across it.
+        let _ = run_compact(terminal, state, agent).await;
         if agent.session_id() != before {
             state.push(Entry::Info(
                 "(auto-compacted: approaching the context limit)".into(),
@@ -2829,7 +2940,7 @@ async fn run_turn_ac<B: ratatui::backend::Backend>(
     // the session id: a cancelled/failed compaction leaves it unchanged, and
     // retrying would just overflow again — so bail instead of looping.
     let before = agent.session_id().to_string();
-    run_compact(terminal, state, agent).await;
+    let _ = run_compact(terminal, state, agent).await;
     if agent.session_id() == before {
         return TurnOutcome::Stopped;
     }
@@ -2839,7 +2950,6 @@ async fn run_turn_ac<B: ratatui::backend::Backend>(
         "(auto-compacted: the context window was full)".into(),
     ));
     state.push(Entry::User(input.clone()));
-    state.working = true;
     let retry = run_turn(terminal, state, agent, input).await;
     if retry == TurnOutcome::ContextOverflow {
         state.push(Entry::Error(
@@ -2855,18 +2965,25 @@ async fn run_turn_ac<B: ratatui::backend::Backend>(
 /// model sees its prior work as context. Esc / Ctrl-C during any turn
 /// (or a stream error) returns [`TurnOutcome::Stopped`] and halts the
 /// loop early.
+///
+/// Returns the summed wall-clock of the iterations that ran, which the
+/// caller puts in the status line. `/loop` is the command you walk away
+/// from, so it is the one that most needs to say how long it took.
 async fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state: &mut State,
     agent: &mut Agent,
     spec: LoopSpec,
-) {
+) -> Option<Duration> {
+    let mut total: Option<Duration> = None;
     for i in 0..spec.count {
         state.push(Entry::Info(format!("loop {}/{}", i + 1, spec.count)));
         state.push(Entry::User(spec.prompt.clone()));
-        state.working = true;
+        let owned = state.begin_work();
         let outcome = run_turn_ac(terminal, state, agent, spec.prompt.clone()).await;
-        state.working = false;
+        if let Some(d) = state.end_work(owned) {
+            total = Some(total.unwrap_or_default() + d);
+        }
         // Nothing inside run_turn touches these, so a long loop would show
         // stale token counts and context gauge until the final iteration —
         // refresh both between turns.
@@ -2881,6 +2998,7 @@ async fn run_loop<B: ratatui::backend::Backend>(
             break;
         }
     }
+    total
 }
 
 /// Drive `agent.compact()` — summarize the session with the model and
@@ -2893,10 +3011,12 @@ async fn run_compact<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state: &mut State,
     agent: &mut Agent,
-) {
+) -> Option<Duration> {
     let before = agent.context_estimate();
     state.push(Entry::Info("compacting session…".into()));
-    state.working = true;
+    // `/compact` starts its own clock; an auto-compaction inside a turn
+    // inherits the caller's and must leave it running.
+    let owned = state.begin_work();
     let result = {
         let fut = agent.compact();
         pin_mut!(fut);
@@ -2930,9 +3050,9 @@ async fn run_compact<B: ratatui::backend::Backend>(
             if interrupted {
                 // Dropping the future cancels the summarize call; the
                 // agent hasn't touched its history yet.
-                state.working = false;
+                let took = state.end_work(owned);
                 state.push(Entry::Info("(interrupted — session unchanged)".into()));
-                return;
+                return took;
             }
             tokio::select! {
                 r = &mut fut => break r,
@@ -2940,7 +3060,7 @@ async fn run_compact<B: ratatui::backend::Backend>(
             }
         }
     };
-    state.working = false;
+    let took = state.end_work(owned);
     match result {
         Ok(()) => {
             let after = agent.context_estimate();
@@ -2956,6 +3076,7 @@ async fn run_compact<B: ratatui::backend::Backend>(
         }
         Err(e) => state.push(Entry::Error(format!("compact: {e:#}"))),
     }
+    took
 }
 
 /// Whether `env_var` is the key for the provider the live `LlmClient` is
@@ -3984,7 +4105,7 @@ fn draw(f: &mut ratatui::Frame, state: &mut State) {
     };
 
     let inside = chunks[3];
-    let body_style = if state.working {
+    let body_style = if state.working() {
         Style::default().fg(th.dim)
     } else {
         Style::default().fg(th.fg)
@@ -4216,7 +4337,7 @@ fn draw(f: &mut ratatui::Frame, state: &mut State) {
         ),
         Span::styled(" · ", Style::default().fg(th.dim)),
     ];
-    if state.working {
+    if let Some(since) = state.working_since {
         let frame = SPINNER[state.frame % SPINNER.len()];
         status_spans.push(Span::styled(frame, Style::default().fg(th.purple)));
         status_spans.push(Span::raw(" "));
@@ -4238,6 +4359,14 @@ fn draw(f: &mut ratatui::Frame, state: &mut State) {
             };
             status_spans.push(Span::styled(".", style));
         }
+        // How long the prompt has been in flight. Redrawn on the same
+        // 33ms tick as the spinner, so it counts up smoothly even while
+        // the model is silent between stream events.
+        status_spans.push(Span::raw(" "));
+        status_spans.push(Span::styled(
+            format_elapsed(since.elapsed()),
+            Style::default().fg(th.dim),
+        ));
     } else {
         status_spans.push(Span::styled(
             &state.status,
@@ -4320,7 +4449,7 @@ fn draw(f: &mut ratatui::Frame, state: &mut State) {
         "type key · enter set · esc cancel"
     } else if state.pending_approval.is_some() {
         "y/n/a · esc cancel"
-    } else if state.working {
+    } else if state.working() {
         "esc / ^c interrupt"
     } else {
         mode_hints(state.mode)
@@ -6022,6 +6151,184 @@ fn render_entry(entry: &Entry, frame: usize, username: &str) -> Vec<Line<'static
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_elapsed_keeps_a_stable_width_within_each_unit() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), " 0s");
+        assert_eq!(format_elapsed(Duration::from_secs(9)), " 9s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+        // Three columns below a minute, seven from a minute up: the
+        // status bar's later segments shift once, at the minute mark,
+        // and never shift back. Unpadded they would also move at ten
+        // seconds and ten minutes, and jump backwards at the hour.
+        for secs in 0..60 {
+            assert_eq!(
+                format_elapsed(Duration::from_secs(secs)).len(),
+                3,
+                "{secs}s"
+            );
+        }
+        for secs in [60, 599, 600, 3599, 3600, 35_999, 36_000, 86_400, 359_999] {
+            assert_eq!(
+                format_elapsed(Duration::from_secs(secs)).len(),
+                7,
+                "{secs}s"
+            );
+        }
+    }
+
+    #[test]
+    fn format_elapsed_rolls_over_to_minutes_then_hours() {
+        assert_eq!(format_elapsed(Duration::from_secs(60)), " 1m 00s");
+        assert_eq!(format_elapsed(Duration::from_secs(61)), " 1m 01s");
+        assert_eq!(format_elapsed(Duration::from_secs(3599)), "59m 59s");
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), " 1h 00m");
+        assert_eq!(format_elapsed(Duration::from_secs(3660)), " 1h 01m");
+        // No day unit, deliberately: `48h 00m` reads as far too long,
+        // which is the only thing that number is there to say.
+        assert_eq!(format_elapsed(Duration::from_secs(172_800)), "48h 00m");
+    }
+
+    #[test]
+    fn format_elapsed_truncates_rather_than_rounds() {
+        // 1.9s is still "1s": the timer must never report time that has
+        // not elapsed yet.
+        assert_eq!(format_elapsed(Duration::from_millis(1_900)), " 1s");
+        assert_eq!(format_elapsed(Duration::from_millis(59_999)), "59s");
+    }
+
+    #[test]
+    fn end_work_reports_the_time_that_actually_elapsed() {
+        // Asserting the value, not just that there is one: a refactor to
+        // `.map(|_| Duration::default())` would report " 0s" for every
+        // turn and still satisfy every other test here.
+        let mut state = State::new("session", "model");
+        state.begin_work();
+        std::thread::sleep(Duration::from_millis(5));
+        let d = state.end_work(true).expect("the owner gets a duration");
+        assert!(d >= Duration::from_millis(5), "reported {d:?}");
+    }
+
+    #[test]
+    fn nested_work_blocks_do_not_restart_the_clock() {
+        // An auto-compaction inside a turn calls begin_work again; the
+        // prompt has been in flight since the user hit enter, so the
+        // inner block must neither restart nor stop the clock.
+        let mut state = State::new("session", "model");
+        assert!(!state.working());
+        let outer = state.begin_work();
+        assert!(outer);
+        let started = state.working_since;
+
+        let inner = state.begin_work();
+        assert!(!inner, "a nested block must not claim the clock");
+        assert_eq!(state.working_since, started, "clock was restarted");
+        assert!(state.end_work(inner).is_none());
+        assert!(state.working(), "a nested block must not stop the clock");
+
+        assert!(state.end_work(outer).is_some());
+        assert!(!state.working());
+        // And the clock is genuinely released, not just hidden.
+        assert!(state.end_work(true).is_none());
+    }
+
+    #[test]
+    fn waiting_on_an_approval_prompt_does_not_count_as_working() {
+        // Build mode is the default and gates every tool call on a
+        // keystroke, so without this the bar reads `thinking... 4m 12s`
+        // while teleia is doing nothing but waiting for a `y`.
+        let mut state = State::new("session", "model");
+        state.begin_work();
+        state.hold_work();
+        std::thread::sleep(Duration::from_millis(30));
+        state.resume_work();
+        let d = state.end_work(true).expect("the owner gets a duration");
+        assert!(d < Duration::from_millis(30), "counted the wait: {d:?}");
+    }
+
+    #[test]
+    fn a_hold_left_over_from_the_previous_turn_is_not_refunded_into_this_one() {
+        // A turn can end with its approval prompt still up, so the hold
+        // outlives it. Carried into the next turn it would refund a span
+        // longer than that turn had run, pushing its start into the
+        // future and pinning the timer at ` 0s`.
+        let mut state = State::new("session", "model");
+        state.begin_work();
+        state.hold_work();
+        std::thread::sleep(Duration::from_millis(30));
+        state.end_work(true);
+
+        state.begin_work();
+        state.resume_work();
+        std::thread::sleep(Duration::from_millis(5));
+        let d = state.end_work(true).expect("the owner gets a duration");
+        assert!(
+            d >= Duration::from_millis(5),
+            "clock started in the future: {d:?}"
+        );
+    }
+
+    #[test]
+    fn resuming_without_a_pending_hold_leaves_the_clock_alone() {
+        // The prompt is cleared from two paths — a decision key and
+        // Ctrl-C — so resume runs more than once per hold.
+        let mut state = State::new("session", "model");
+        state.begin_work();
+        let started = state.working_since;
+        state.resume_work();
+        assert_eq!(state.working_since, started);
+        assert!(state.working());
+    }
+
+    /// Render a frame and return only the status bar, the buffer's last
+    /// row. Asserting against the whole flattened frame would let every
+    /// negative assertion pass for the wrong reason — a bar that did not
+    /// render at all contains no `thinking` either — so this guards that
+    /// the row is really there before handing it back.
+    fn status_row(state: &mut State, width: u16) -> String {
+        use ratatui::backend::TestBackend;
+        let mut term = ratatui::Terminal::new(TestBackend::new(width, 24)).unwrap();
+        term.draw(|f| draw(f, state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let y = buf.area.height - 1;
+        let row: String = (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(
+            row.starts_with(" INS  · "),
+            "status bar did not render: {row:?}"
+        );
+        row
+    }
+
+    #[test]
+    fn status_bar_shows_the_elapsed_timer_while_a_turn_runs() {
+        // A green `format_elapsed` proves nothing about a helper nothing
+        // calls, so drive the real `draw`.
+        //
+        // The clock is fresh rather than a manufactured past one:
+        // `Instant::now() - Duration` panics on Windows whenever the
+        // offset exceeds uptime, and CI has a windows-latest leg. What
+        // the wider renderings look like is `format_elapsed`'s own test.
+        let mut state = State::new("sessionabc123", "gpt");
+        state.working_since = Some(Instant::now());
+        let row = status_row(&mut state, 140);
+        // Two spaces before the `0s`: the padded field, read straight out
+        // of the frame buffer rather than out of the formatter.
+        assert!(row.contains("thinking...  0s · gpt"), "{row:?}");
+        // The interrupt hint reads the same field as the spinner.
+        assert!(row.contains("esc / ^c interrupt"), "{row:?}");
+    }
+
+    #[test]
+    fn status_bar_yields_the_timer_slot_to_the_status_text_when_idle() {
+        let mut state = State::new("sessionabc123", "gpt");
+        state.status = "session sessi · ready".into();
+        let row = status_row(&mut state, 140);
+        assert!(row.contains("session sessi · ready"), "{row:?}");
+        assert!(!row.contains("thinking"), "{row:?}");
+        assert!(!row.contains("esc / ^c interrupt"), "{row:?}");
+    }
 
     #[test]
     fn ctx_pct_tracks_budget_share() {
