@@ -65,11 +65,6 @@ impl LlmEntry {
     }
 }
 
-// Fields are read at deserialise time only — the LSP runtime hasn't
-// been wired yet, so rustc rightly notices nothing in the rest of the
-// codebase touches `command`/`args`/`root_patterns`. Suppress the
-// warning until the LSP feature lands.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct LspEntry {
     pub command: String,

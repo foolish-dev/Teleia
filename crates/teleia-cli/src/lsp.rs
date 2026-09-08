@@ -1172,6 +1172,46 @@ fn position_schema() -> Value {
     })
 }
 
+/// Whether `dir` — or any directory above it — looks like a project
+/// this server should be started for.
+///
+/// An empty pattern list matches everything, which is what a config that
+/// never set one has always meant. Patterns are shell globs tested
+/// against file names, so both `"Cargo.toml"` and `"*.csproj"` work; one
+/// that fails to parse as a glob still matches as a literal name. The
+/// walk goes upward because teleia is routinely launched from a
+/// subdirectory of the workspace its servers serve.
+pub fn root_matches(dir: &Path, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let globs: Vec<glob::Pattern> = patterns
+        .iter()
+        .filter(|p| p.contains(['*', '?', '[']))
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
+    for ancestor in dir.ancestors() {
+        // Literal names are the common case and answer without listing
+        // the directory at all.
+        if patterns.iter().any(|p| ancestor.join(p).exists()) {
+            return true;
+        }
+        if globs.is_empty() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(ancestor) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            if globs.iter().any(|g| g.matches(&name.to_string_lossy())) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Set of running LSP clients. Used by the TUI's `/lsps` panel — for
 /// now the registry just owns the clients so they stay alive (the LSP
 /// children are killed on Drop via `kill_on_drop`) and exposes a
@@ -2178,6 +2218,43 @@ mod tests {
         assert!(provider_enabled(&json!({ "workDoneProgress": true })));
         assert!(!provider_enabled(&json!(false)));
         assert!(!provider_enabled(&Value::Null));
+    }
+
+    #[test]
+    fn root_matches_everything_when_no_pattern_is_configured() {
+        // An unset key has always meant "start this server anywhere", and
+        // wiring the field must not quietly change that.
+        assert!(root_matches(Path::new("/"), &[]));
+    }
+
+    #[test]
+    fn root_matches_walks_up_from_the_launch_directory() {
+        // teleia is routinely launched from a subdirectory of the
+        // workspace its servers serve.
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Present in this crate's own directory…
+        assert!(root_matches(crate_dir, &["Cargo.toml".into()]));
+        // …and only at the workspace root above it, so this one can only
+        // pass via the upward walk.
+        assert!(root_matches(crate_dir, &[".github".into()]));
+        // Any one pattern matching is enough.
+        assert!(root_matches(
+            crate_dir,
+            &["nothing.xyz".into(), "Cargo.toml".into()]
+        ));
+        assert!(!root_matches(
+            crate_dir,
+            &["definitely-not-here.xyz".into()]
+        ));
+    }
+
+    #[test]
+    fn root_matches_accepts_a_glob_not_just_a_literal_name() {
+        // The key is called `root_patterns`; a user writing `*.lock` and
+        // getting silence would be the worst of both worlds.
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(root_matches(crate_dir, &["*.lock".into()]));
+        assert!(!root_matches(crate_dir, &["*.nope-xyz".into()]));
     }
 
     #[test]
