@@ -22,6 +22,15 @@ pub trait ToolRouter: Send {
     /// child process unless the router itself refuses. Default: a no-op,
     /// for routers with no notion of a server.
     fn set_disabled_servers(&mut self, _disabled: &BTreeSet<String>) {}
+
+    /// Whether `name` only *inspects*: it reads, and it neither writes,
+    /// executes, nor reaches the network. Plan mode runs these
+    /// unprompted, so this is a claim the router makes about a name it
+    /// owns, and the default is `false` — a router's names usually come
+    /// from an external server whose effects teleia cannot know.
+    fn inspects_only(&self, _name: &str) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -388,9 +397,39 @@ fn needs_consent(name: &str) -> bool {
 /// without this a server advertising `read` would inherit `read`'s
 /// unprompted pass and run third-party code in the one mode that
 /// promises nothing runs.
-fn plan_gate(name: &str, arguments: &str, routed: bool) -> PlanGate {
-    if routed {
-        return PlanGate::Block;
+/// How a tool call reached the dispatcher — the first thing
+/// [`plan_gate`] keys on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Routing {
+    /// One of teleia's own tools, classified by name below.
+    Builtin,
+    /// An external router's tool that vouched for itself as read-only.
+    RoutedInspector,
+    /// An external router's tool whose effects teleia cannot know.
+    Routed,
+}
+
+impl Routing {
+    /// Whether the call dispatches through the router rather than the
+    /// built-in table. Both routed classes do — they differ only in what
+    /// plan mode will run without asking.
+    fn is_routed(self) -> bool {
+        !matches!(self, Routing::Builtin)
+    }
+}
+
+fn plan_gate(name: &str, arguments: &str, routing: Routing) -> PlanGate {
+    match routing {
+        // Server tool names arrive verbatim from the server's
+        // `tools/list` (cli/src/mcp.rs:438), so one can advertise `read`
+        // and do anything at all behind it. Never auto-allowed.
+        Routing::Routed => return PlanGate::Block,
+        // A router that owns the name and vouches for it earns the same
+        // class as a built-in that inspects. Plan mode exists for
+        // read-only investigation, and blocking `lsp_definition` while
+        // running `grep` unprompted inspects less, not more safely.
+        Routing::RoutedInspector => return PlanGate::Inspect,
+        Routing::Builtin => {}
     }
     if inspects_only(name) {
         return PlanGate::Inspect;
@@ -830,6 +869,17 @@ impl Agent {
     /// Resolved *before* the permission gate in [`Agent::turn`]: the
     /// answer decides the call's permission class, not merely where it
     /// dispatches.
+    /// Where a tool name dispatches, and how far plan mode can trust it.
+    fn routing(&self, name: &str) -> Routing {
+        if !self.is_routed(name) {
+            return Routing::Builtin;
+        }
+        match self.router.as_ref().map(|r| r.inspects_only(name)) {
+            Some(true) => Routing::RoutedInspector,
+            _ => Routing::Routed,
+        }
+    }
+
     fn is_routed(&self, name: &str) -> bool {
         !self.shadowed_router_tools.contains(name)
             && !self.is_disabled_router_tool(name)
@@ -1293,8 +1343,8 @@ impl Agent {
                     // where it dispatches. Server tool names arrive
                     // verbatim from the server's `tools/list`
                     // (cli/src/mcp.rs:438), so one can advertise `read`.
-                    let routed = self.is_routed(&call.function.name);
-                    let gate = plan_gate(&call.function.name, &call.function.arguments, routed);
+                    let routing = self.routing(&call.function.name);
+                    let gate = plan_gate(&call.function.name, &call.function.arguments, routing);
                     // Permission gate. Auto runs everything; Plan splits
                     // by effect (see [`PlanGate`]) into run / prompt /
                     // synthesize-"blocked"; Build prompts per-call.
@@ -1304,8 +1354,8 @@ impl Agent {
                         PermissionMode::Plan if gate == PlanGate::Block => {
                             // Name the reason when the call is external —
                             // a refused `read` otherwise reads as a bug.
-                            let via = if routed {
-                                " (an external MCP/LSP tool, never auto-allowed in plan mode)"
+                            let via = if routing == Routing::Routed {
+                                " (an external tool whose effects teleia can't verify, never auto-allowed in plan mode)"
                             } else {
                                 ""
                             };
@@ -1372,7 +1422,7 @@ impl Agent {
                         arguments: call.function.arguments.clone(),
                     };
 
-                    let output = if routed {
+                    let output = if routing.is_routed() {
                         let r = self.router.as_mut().unwrap();
                         match r.dispatch(&call.function.name, &call.function.arguments).await {
                             Ok(o) => o,
@@ -1563,6 +1613,29 @@ mod tests {
             _args: &'a str,
         ) -> BoxFuture<'a, Result<String>> {
             Box::pin(async { Ok("routed".to_string()) })
+        }
+    }
+
+    /// A router that vouches for its one tool as read-only, the way
+    /// `LspRegistry` does for the `lsp_*` names.
+    struct FakeInspector(&'static str);
+
+    impl ToolRouter for FakeInspector {
+        fn definitions(&self) -> Vec<ToolDef> {
+            vec![fake_def(self.0)]
+        }
+        fn handles(&self, name: &str) -> bool {
+            name == self.0
+        }
+        fn dispatch<'a>(
+            &'a mut self,
+            _name: &'a str,
+            _args: &'a str,
+        ) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async { Ok("routed".to_string()) })
+        }
+        fn inspects_only(&self, name: &str) -> bool {
+            name == self.0
         }
     }
 
@@ -2165,14 +2238,22 @@ mod tests {
             "read", "list", "glob", "grep", "head", "tail", "tree", "stat", "diff", "which", "wc",
             "sha256", "date", "json", "base64", "hexdump", "du", "realpath",
         ] {
-            assert_eq!(plan_gate(name, "{}", false), PlanGate::Inspect, "{name}");
+            assert_eq!(
+                plan_gate(name, "{}", Routing::Builtin),
+                PlanGate::Inspect,
+                "{name}"
+            );
         }
         // …outbound network, and anything that compiles or runs the working
         // tree, asks first — `test`/`typecheck`/`lint` are cargo, i.e. they
         // execute build.rs and proc macros, and `env` puts the environment
         // in the transcript.
         for name in ["fetch", "web_search", "env", "lint", "typecheck", "test"] {
-            assert_eq!(plan_gate(name, "{}", false), PlanGate::Ask, "{name}");
+            assert_eq!(
+                plan_gate(name, "{}", Routing::Builtin),
+                PlanGate::Ask,
+                "{name}"
+            );
         }
         // …and mutation is still short-circuited. `format` belongs here, not
         // with its lint/typecheck/test siblings: `cargo fmt --all` rewrites
@@ -2194,7 +2275,11 @@ mod tests {
             "todo_write",
             "no_such_tool",
         ] {
-            assert_eq!(plan_gate(name, "{}", false), PlanGate::Block, "{name}");
+            assert_eq!(
+                plan_gate(name, "{}", Routing::Builtin),
+                PlanGate::Block,
+                "{name}"
+            );
         }
     }
 
@@ -2203,22 +2288,39 @@ mod tests {
         // Inspection subcommands run in plan mode; mutating ones don't.
         for sub in ["status", "diff", "log"] {
             let args = json!({ "subcommand": sub }).to_string();
-            assert_eq!(plan_gate("git", &args, false), PlanGate::Inspect, "{sub}");
+            assert_eq!(
+                plan_gate("git", &args, Routing::Builtin),
+                PlanGate::Inspect,
+                "{sub}"
+            );
         }
         for sub in ["add", "commit"] {
             let args = json!({ "subcommand": sub }).to_string();
-            assert_eq!(plan_gate("git", &args, false), PlanGate::Block, "{sub}");
+            assert_eq!(
+                plan_gate("git", &args, Routing::Builtin),
+                PlanGate::Block,
+                "{sub}"
+            );
         }
         // Malformed / missing subcommand is treated as mutating.
-        assert_eq!(plan_gate("git", "not json", false), PlanGate::Block);
-        assert_eq!(plan_gate("git", "{}", false), PlanGate::Block);
+        assert_eq!(
+            plan_gate("git", "not json", Routing::Builtin),
+            PlanGate::Block
+        );
+        assert_eq!(plan_gate("git", "{}", Routing::Builtin), PlanGate::Block);
         // `paths` is appended without a `--` separator (teleia-tools:1612),
         // so a leading dash is an option: `git diff --output=FILE` writes a
         // file. Plan mode must not run that unprompted.
         let flagged = json!({ "subcommand": "diff", "paths": ["--output=/tmp/pwned"] }).to_string();
-        assert_eq!(plan_gate("git", &flagged, false), PlanGate::Block);
+        assert_eq!(
+            plan_gate("git", &flagged, Routing::Builtin),
+            PlanGate::Block
+        );
         let scoped = json!({ "subcommand": "diff", "paths": ["src/lib.rs"] }).to_string();
-        assert_eq!(plan_gate("git", &scoped, false), PlanGate::Inspect);
+        assert_eq!(
+            plan_gate("git", &scoped, Routing::Builtin),
+            PlanGate::Inspect
+        );
     }
 
     #[test]
@@ -2226,10 +2328,43 @@ mod tests {
         // MCP servers name their own tools with no namespacing
         // (cli/src/mcp.rs:438) and are dispatched ahead of the built-ins,
         // so a server advertising `read` must not inherit `read`'s pass.
-        assert_eq!(plan_gate("read", "{}", true), PlanGate::Block);
-        assert_eq!(plan_gate("fetch", "{}", true), PlanGate::Block);
+        assert_eq!(plan_gate("read", "{}", Routing::Routed), PlanGate::Block);
+        assert_eq!(plan_gate("fetch", "{}", Routing::Routed), PlanGate::Block);
         let status = json!({ "subcommand": "status" }).to_string();
-        assert_eq!(plan_gate("git", &status, true), PlanGate::Block);
+        assert_eq!(plan_gate("git", &status, Routing::Routed), PlanGate::Block);
+    }
+
+    #[test]
+    fn a_router_that_vouches_for_a_name_gets_the_inspect_class() {
+        // Plan mode exists for read-only investigation. Blocking a
+        // language server's `definition` query while running `grep`
+        // unprompted inspects less, not more safely — so a router that
+        // owns the name and declares it read-only earns `read`'s class.
+        assert_eq!(
+            plan_gate("lsp_definition", "{}", Routing::RoutedInspector),
+            PlanGate::Inspect
+        );
+        // The same name from a router that made no such claim does not.
+        assert_eq!(
+            plan_gate("lsp_definition", "{}", Routing::Routed),
+            PlanGate::Block
+        );
+    }
+
+    #[test]
+    fn routing_asks_the_router_before_trusting_a_name() {
+        // Three classes, and the vouching is the router's to do: teleia
+        // cannot tell from a name what an external tool does.
+        let mut agent = fake_agent();
+        assert_eq!(agent.routing("read"), Routing::Builtin);
+
+        agent.set_tool_router(Box::new(FakeRouter("kb_search")));
+        assert_eq!(agent.routing("kb_search"), Routing::Routed);
+        // A router only speaks for names it handles.
+        assert_eq!(agent.routing("read"), Routing::Builtin);
+
+        agent.set_tool_router(Box::new(FakeInspector("kb_search")));
+        assert_eq!(agent.routing("kb_search"), Routing::RoutedInspector);
     }
 
     #[test]
