@@ -7,7 +7,7 @@
 #   $env:PREFIX = "C:\Tools"      # default: $env:USERPROFILE\.local\bin
 #   $env:TAG = "v0.2.0"           # pin a release tag (default: latest)
 #   $env:FROM_SOURCE = "1"        # skip prebuilt download; cargo build instead
-#   $env:BRANCH = "main"          # source-build branch (default: dev)
+#   $env:BRANCH = "v0.1.0"        # source-build branch or tag (default: dev)
 #   $env:NO_PATH = "1"            # don't touch your user PATH
 #   $env:NO_OLLAMA_HINT = "1"     # suppress the post-install Ollama nudge
 #   $env:AUTO_INSTALL = "1"       # bootstrap missing build deps (rustup) without prompting
