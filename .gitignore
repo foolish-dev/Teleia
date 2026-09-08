@@ -8,3 +8,7 @@ Cargo.lock.bak
 
 # stray local build artifact
 /verify_fix
+
+# Transient git worktrees created for isolated agent runs. They are real
+# repositories, so a bare `git add -A` commits them as gitlinks.
+.claude/worktrees/
