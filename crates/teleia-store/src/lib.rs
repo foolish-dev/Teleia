@@ -16,7 +16,9 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("mkdir {parent:?}"))?;
         }
+        create_owner_only(path);
         let conn = Connection::open(path).with_context(|| format!("open {path:?}"))?;
+        restrict_to_owner(path);
         // A second connection to the same file (e.g. the SIGUSR1 theme
         // reload opens its own) can collide with an in-flight write.
         // Without a busy timeout SQLite returns SQLITE_BUSY immediately
@@ -257,6 +259,59 @@ fn data_path() -> Result<PathBuf> {
     }
 }
 
+/// Create the store file owner-only, before SQLite can create it through
+/// the process umask.
+///
+/// [`restrict_to_owner`] repairs the mode, but a chmod cannot revoke a
+/// descriptor: `Connection::open` creates the file `0644` on a stock
+/// account, and another local user looping on `open(2)` can hold an fd
+/// through the tightening and read every key written afterwards while
+/// `ls -l` shows `0600`. Creating it ourselves closes that window — the
+/// file never exists at a readable mode.
+///
+/// No-op when the file already exists (`create_new` fails `AlreadyExists`),
+/// so the repair path below still owns databases an earlier build wrote.
+#[cfg(unix)]
+fn create_owner_only(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path);
+}
+
+#[cfg(not(unix))]
+fn create_owner_only(_path: &Path) {}
+
+/// Narrow the store file to owner-only when it is readable by anyone else.
+///
+/// This database is a secrets file: `prefs` holds every provider API key the
+/// user has entered in plaintext (`main.rs`'s `pref_key_for` → `set_pref`),
+/// and `messages` holds the full conversation. [`create_owner_only`] keeps a
+/// *new* file out of the `022` umask's `0644`; this is the repair half, for a
+/// database an earlier build already created world-readable — without it that
+/// install leaks its keys for good.
+///
+/// SQLite gives the rollback journal the same mode as the database it belongs
+/// to, so fixing the main file before the first write covers the sidecars.
+/// Best-effort: a store on a filesystem with no Unix modes (a mounted FAT
+/// volume, WSL DrvFs) must still open.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) {}
+
 fn unix_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -441,5 +496,70 @@ mod tests {
         // A fresh session with no rows starts at 0.
         let empty = store.create_session("m").unwrap();
         assert_eq!(store.next_seq(&empty).unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_file_is_not_readable_by_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_db();
+        let _cleanup = Cleanup(path.clone());
+
+        let mode = |p: &PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // A freshly created store holds plaintext provider keys, so it must
+        // never be born group/world-readable via the default 022 umask.
+        {
+            let store = Store::open_at(&path).unwrap();
+            store
+                .set_pref("api_key:ANTHROPIC_API_KEY", "sk-secret")
+                .unwrap();
+        }
+        assert_eq!(mode(&path), 0o600, "fresh store must be owner-only");
+
+        // A database an earlier build already wrote at 0644 is repaired on
+        // the next open, not left leaking for the life of the install.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let store = Store::open_at(&path).unwrap();
+        assert_eq!(
+            mode(&path),
+            0o600,
+            "existing world-readable store must be tightened"
+        );
+        assert_eq!(
+            store
+                .get_pref("api_key:ANTHROPIC_API_KEY")
+                .unwrap()
+                .as_deref(),
+            Some("sk-secret"),
+            "tightening must not disturb the contents"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_owner_only_makes_the_file_and_never_truncates_an_existing_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_db();
+        let _cleanup = Cleanup(path.clone());
+        let mode = |p: &PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // The mode `Store::open_at` asserts is also reachable by repairing a
+        // 0644 file after the fact, so pin the creating half on its own:
+        // the file has to exist at 0600 before SQLite ever sees the path,
+        // because a chmod cannot revoke an fd another user already holds.
+        create_owner_only(&path);
+        assert_eq!(mode(&path), 0o600, "must be created owner-only");
+
+        // And it must be `create_new`: this runs on every open, so a
+        // `create(true).write(true)` here would truncate the user's whole
+        // database — every session and every saved key — on the next launch.
+        std::fs::write(&path, b"existing bytes").unwrap();
+        create_owner_only(&path);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"existing bytes",
+            "an existing store must be left completely alone"
+        );
     }
 }
