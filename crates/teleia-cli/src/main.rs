@@ -559,8 +559,8 @@ async fn main() -> Result<()> {
     // `tui::run` takes over the screen.
     let mut boot = boot::Boot::new();
 
-    // LSP servers: initialize handshake + expose `lsp_diagnostics`
-    // tool. The registry is folded into the agent's tool router below
+    // LSP servers: initialize handshake + expose the `lsp_*` tools.
+    // The registry is folded into the agent's tool router below
     // (alongside MCP) so the children stay alive for the whole run.
     let lsp_registry: Option<lsp::LspRegistry> = if cfg.lsps.is_empty() {
         None
@@ -660,7 +660,7 @@ async fn main() -> Result<()> {
         let running = live.len();
         let total = cfg.lsps.len();
         let label = if running > 0 {
-            "running (lsp_diagnostics tool wired)"
+            "running (lsp_* tools wired)"
         } else {
             "running"
         };
