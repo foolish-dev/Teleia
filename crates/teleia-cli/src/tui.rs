@@ -3277,7 +3277,16 @@ fn handle_slash(state: &mut State, agent: &mut Agent, cmd: &str) {
                 return;
             }
             match agent.delete_alias(arg) {
-                Ok(()) => state.push(Entry::Info(format!("deleted alias '{arg}'"))),
+                Ok(d) if d.session_deleted => state.push(Entry::Info(format!(
+                    "deleted alias '{arg}' and its transcript"
+                ))),
+                Ok(d) if d.remaining.is_empty() => state.push(Entry::Info(format!(
+                    "deleted alias '{arg}' — the active session keeps its transcript"
+                ))),
+                Ok(d) => state.push(Entry::Info(format!(
+                    "deleted alias '{arg}' — session still saved as {}",
+                    d.remaining.join(", ")
+                ))),
                 Err(e) => state.push(Entry::Error(format!("delete: {e}"))),
             }
         }

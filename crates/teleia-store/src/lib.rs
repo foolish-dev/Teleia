@@ -24,6 +24,12 @@ impl Store {
         // Without a busy timeout SQLite returns SQLITE_BUSY immediately
         // rather than waiting, which can hard-error a turn's persistence.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // SQLite enforces foreign keys per-connection and defaults them
+        // *off*, which silently turned the `ON DELETE CASCADE` below into
+        // decoration: deleting a session left its messages and aliases
+        // behind. Every connection this crate opens turns them on, so a
+        // deleted session takes its transcript with it.
+        conn.pragma_update(None, "foreign_keys", true)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
@@ -218,6 +224,59 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Every alias name currently pointing at `session_id`. A session that
+    /// comes back empty is unreachable: no `/load` can ever name it again,
+    /// so its transcript is dead weight in a file that also holds the
+    /// user's API keys.
+    pub fn aliases_for(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM aliases WHERE session_id = ?1 ORDER BY name")?;
+        let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Delete a session and, by cascade, its messages and any aliases still
+    /// naming it. Returns whether a session row actually matched, so a
+    /// caller can tell a real deletion from a no-op.
+    pub fn delete_session(&self, session_id: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+        Ok(changed > 0)
+    }
+
+    /// Drop every session that never carried a conversation, except `keep`.
+    /// Returns how many were removed.
+    ///
+    /// Each launch mints a session plus a durable timestamped alias before
+    /// the user has typed anything, so quitting at the prompt leaves a row
+    /// holding nothing but the system prompt — and `/list` fills up with
+    /// names for conversations that never happened. Nothing of the user's
+    /// is in such a session, so startup collects them.
+    ///
+    /// A row whose payload doesn't parse counts as content: [`Store::load`]
+    /// deliberately survives a corrupt message rather than discarding the
+    /// session around it, and this must not be the thing that discards it.
+    pub fn prune_empty_sessions(&self, keep: &str) -> Result<usize> {
+        let removed = self.conn.execute(
+            "DELETE FROM sessions
+              WHERE id <> ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM messages
+                     WHERE messages.session_id = sessions.id
+                       AND (NOT json_valid(payload)
+                            OR json_extract(payload, '$.role') <> 'system')
+                )",
+            params![keep],
+        )?;
+        Ok(removed)
+    }
 }
 
 /// Where to keep the sqlite store. Honours `$XDG_DATA_HOME` if set
@@ -336,6 +395,117 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    fn user(text: &str) -> Message {
+        Message::User {
+            content: text.into(),
+        }
+    }
+
+    fn system() -> Message {
+        Message::System {
+            content: "prompt".into(),
+        }
+    }
+
+    #[test]
+    fn deleting_a_session_cascades_to_its_messages_and_aliases() {
+        let path = tmp_db();
+        let _cleanup = Cleanup(path.clone());
+        let store = Store::open_at(&path).unwrap();
+        let doomed = store.create_session("m").unwrap();
+        let kept = store.create_session("m").unwrap();
+        store.append(&doomed, 0, &user("secret")).unwrap();
+        store.save_alias("doomed", &doomed).unwrap();
+        store.append(&kept, 0, &user("keep me")).unwrap();
+        store.save_alias("kept", &kept).unwrap();
+
+        assert!(store.delete_session(&doomed).unwrap());
+
+        // The cascade only fires with the foreign_keys pragma on; without it
+        // the messages below survive as unreachable rows.
+        assert!(store.load(&doomed).unwrap().is_empty());
+        assert!(store.aliases_for(&doomed).unwrap().is_empty());
+        assert!(store.resolve_alias("doomed").is_err());
+
+        assert_eq!(store.load(&kept).unwrap().len(), 1);
+        assert_eq!(store.resolve_alias("kept").unwrap(), kept);
+    }
+
+    #[test]
+    fn deleting_a_missing_session_reports_no_match() {
+        let path = tmp_db();
+        let _cleanup = Cleanup(path.clone());
+        let store = Store::open_at(&path).unwrap();
+        assert!(!store.delete_session("nope").unwrap());
+    }
+
+    #[test]
+    fn aliases_for_lists_every_name_pointing_at_a_session() {
+        let path = tmp_db();
+        let _cleanup = Cleanup(path.clone());
+        let store = Store::open_at(&path).unwrap();
+        let a = store.create_session("m").unwrap();
+        let b = store.create_session("m").unwrap();
+        store.save_alias("last", &a).unwrap();
+        store.save_alias("2026-01-01-0000", &a).unwrap();
+        store.save_alias("other", &b).unwrap();
+
+        assert_eq!(
+            store.aliases_for(&a).unwrap(),
+            vec!["2026-01-01-0000".to_string(), "last".to_string()]
+        );
+        assert_eq!(store.aliases_for(&b).unwrap(), vec!["other".to_string()]);
+        assert!(store.aliases_for("missing").unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_drops_system_only_sessions_and_keeps_the_active_one() {
+        let path = tmp_db();
+        let _cleanup = Cleanup(path.clone());
+        let store = Store::open_at(&path).unwrap();
+
+        let empty = store.create_session("m").unwrap();
+        store.append(&empty, 0, &system()).unwrap();
+        store.save_alias("2026-01-01-0000", &empty).unwrap();
+
+        let talked = store.create_session("m").unwrap();
+        store.append(&talked, 0, &system()).unwrap();
+        store.append(&talked, 1, &user("hi")).unwrap();
+
+        let active = store.create_session("m").unwrap();
+
+        assert_eq!(store.prune_empty_sessions(&active).unwrap(), 1);
+        assert!(store.load(&empty).unwrap().is_empty());
+        // The name went with it, so `/list` stops advertising a session
+        // that no longer exists.
+        assert!(store.resolve_alias("2026-01-01-0000").is_err());
+        assert_eq!(store.load(&talked).unwrap().len(), 2);
+        // The just-created session has no messages at all yet and must
+        // survive its own startup sweep.
+        assert!(store.aliases_for(&active).unwrap().is_empty());
+        assert_eq!(store.next_seq(&active).unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_keeps_a_session_whose_only_content_is_unreadable() {
+        let path = tmp_db();
+        let _cleanup = Cleanup(path.clone());
+        let store = Store::open_at(&path).unwrap();
+        let active = store.create_session("m").unwrap();
+        let corrupt = store.create_session("m").unwrap();
+        store.append(&corrupt, 0, &system()).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO messages (session_id, seq, payload) VALUES (?1, 1, 'not json')",
+                params![corrupt],
+            )
+            .unwrap();
+
+        assert_eq!(store.prune_empty_sessions(&active).unwrap(), 0);
+        assert_eq!(store.next_seq(&corrupt).unwrap(), 2);
     }
 
     #[test]

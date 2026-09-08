@@ -157,7 +157,7 @@ From Normal mode, `:` opens a command line. The dropdown filters `EX_COMMANDS` b
 | `:q` / `:qa` / `:qall` / `:x` / `:exit`                 | quit                                                  |
 | `:w NAME` / `:wa` / `:wq NAME`                          | save session (no quit on `:wq`)                       |
 | `:e NAME` / `:l NAME` / `:edit NAME` / `:load NAME`     | load session                                          |
-| `:d NAME` / `:bd NAME` / `:delete NAME`                 | delete session                                        |
+| `:d NAME` / `:bd NAME` / `:delete NAME`                 | delete session name (+ transcript if last)            |
 | `:ls` / `:list`                                         | list sessions                                         |
 | `:enew` / `:new` / `:reset`                             | reset session                                         |
 | `:clear`                                                | clear scrollback                                      |
@@ -257,6 +257,8 @@ Everything important survives a restart.
 - **Messages** stream to SQLite as they arrive — no "unsaved" state. Store lives at `$XDG_DATA_HOME/teleia/teleia.sqlite` (Linux), `~/Library/Application Support/teleia/teleia.sqlite` (macOS), `%APPDATA%\teleia\teleia.sqlite` (Windows). `$XDG_DATA_HOME` wins on any platform when set.
 - **Auto-bookmarks** — every launch is tagged `last`; `/reset` rotates the outgoing session to `prev`. So `teleia --resume` always picks up where you left off, and the run before that is recoverable with `/load prev`. Each session also gets a durable `s-YYYY-MM-DD-HHMMSS` alias so none orphan.
 - **Aliases** — `/save NAME` + `/load NAME` for sessions you want to keep by hand.
+- **Deletion** — `/delete NAME` drops the name, and drops the transcript with it once that was the session's last name. A session normally also answers to `last` and its `s-…` stamp, so the messages survive until nothing can reach them; the line you get back says which happened. The session you are currently typing into always keeps its transcript.
+- **Housekeeping** — a launch that gets quit at the prompt leaves a session holding nothing but the system prompt. Startup collects those (and their `s-…` aliases), so `/list` only ever shows conversations that happened. A session with an unreadable message row counts as content and is left alone.
 - **Compaction** — when a long session overflows the model's context window the turn stops with a `run /compact` hint instead of a raw provider 400. `/compact` has the model summarize the conversation (tool schemas dropped from that request, so a just-overflowed history still fits), then continues in a fresh session seeded with the summary; the old session rotates to `prev` like `/reset`.
 - **Sticky preferences** — theme, `/notify` toggle, `/transparent` toggle, permission mode, reasoning-effort tier, active model, and per-provider API keys all persist (CLI flags override). Launching `teleia` with no `--model` picks up wherever you last `/model`-ed.
 - **Input history** — last 500 submissions reload into the `Up`/`Down` recall buffer at startup, deduped against the most recent entry.

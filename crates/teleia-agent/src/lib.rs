@@ -620,6 +620,15 @@ pub fn is_reasoning_effort(s: &str) -> bool {
     REASONING_EFFORTS.contains(&s)
 }
 
+/// What [`Agent::delete_alias`] actually removed. `remaining` lists the
+/// other names that still point at the session, so a caller can say why a
+/// transcript survived its alias.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AliasDeleted {
+    pub remaining: Vec<String>,
+    pub session_deleted: bool,
+}
+
 pub struct Agent {
     llm: LlmClient,
     tools: Vec<ToolDef>,
@@ -668,6 +677,11 @@ impl Agent {
         // `/list` after `last` rolls to the next session.
         let _ = store.save_alias("last", &session_id);
         save_auto_alias(&store, &session_id);
+        // Those two names are minted before the user has typed anything, so
+        // every launch that gets quit at the prompt would otherwise leave a
+        // conversation-less session in `/list` for good. Best-effort: a
+        // store that won't collect them still has to open.
+        let _ = store.prune_empty_sessions(&session_id);
         let mut agent = Self {
             llm,
             tools: teleia_tools::definitions(),
@@ -704,6 +718,7 @@ impl Agent {
                 // skipped by load() (corrupt payload) must not make the next
                 // append reuse a live seq.
                 let seq = store.next_seq(&id)?;
+                let _ = store.prune_empty_sessions(&id);
                 Ok(Self {
                     llm,
                     tools: teleia_tools::definitions(),
@@ -1219,8 +1234,31 @@ impl Agent {
         self.store.list_aliases()
     }
 
-    pub fn delete_alias(&self, name: &str) -> Result<()> {
-        self.store.delete_alias(name)
+    /// Remove an alias, and with it the transcript it named once nothing
+    /// else can reach that transcript.
+    ///
+    /// `/delete` reads as "delete this conversation", but an alias is only a
+    /// name: dropping it used to leave every message on disk, unreachable
+    /// and permanent, in the same file that stores the provider keys. So the
+    /// session goes too — but only when the name was its last one (a session
+    /// normally answers to `last` and its timestamp as well) and only when it
+    /// isn't the session being typed into, which is still appending to it.
+    pub fn delete_alias(&self, name: &str) -> Result<AliasDeleted> {
+        // Resolved before the delete, while the row still exists; a missing
+        // name is reported by `delete_alias` below, which owns that error.
+        let session_id = self.store.resolve_alias(name).ok();
+        self.store.delete_alias(name)?;
+        let Some(session_id) = session_id else {
+            return Ok(AliasDeleted::default());
+        };
+        let remaining = self.store.aliases_for(&session_id)?;
+        let session_deleted = remaining.is_empty()
+            && session_id != self.session_id
+            && self.store.delete_session(&session_id)?;
+        Ok(AliasDeleted {
+            remaining,
+            session_deleted,
+        })
     }
 
     pub fn model(&self) -> &str {
@@ -2868,6 +2906,115 @@ mod tests {
         assert_eq!(format_session_stamp(951_782_400), "s-2000-02-29-000000");
         // Non-zero time-of-day (+1h1m1s).
         assert_eq!(format_session_stamp(1_609_462_861), "s-2021-01-01-010101");
+    }
+
+    #[test]
+    fn deleting_the_last_name_for_a_session_takes_its_transcript_too() {
+        let mut agent = fake_agent();
+        agent
+            .push(Message::User {
+                content: "something private".into(),
+            })
+            .unwrap();
+        let stale = agent.session_id.clone();
+        // Move off it, so the transcript is no longer the one being typed
+        // into, then strip every name but one.
+        agent.reset().unwrap();
+        for name in agent.store.aliases_for(&stale).unwrap() {
+            if name != "prev" {
+                agent.store.delete_alias(&name).unwrap();
+            }
+        }
+
+        let deleted = agent.delete_alias("prev").unwrap();
+
+        assert!(deleted.session_deleted);
+        assert!(deleted.remaining.is_empty());
+        assert!(agent.store.load(&stale).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_one_of_several_names_leaves_the_transcript_alone() {
+        let mut agent = fake_agent();
+        agent
+            .push(Message::User {
+                content: "keep me".into(),
+            })
+            .unwrap();
+        let stale = agent.session_id.clone();
+        agent.reset().unwrap();
+        agent.store.save_alias("spare", &stale).unwrap();
+
+        let deleted = agent.delete_alias("prev").unwrap();
+
+        assert!(!deleted.session_deleted);
+        assert!(deleted.remaining.contains(&"spare".to_string()));
+        assert_eq!(agent.store.load(&stale).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deleting_the_active_sessions_last_name_keeps_the_live_transcript() {
+        let mut agent = fake_agent();
+        agent
+            .push(Message::User {
+                content: "mid-conversation".into(),
+            })
+            .unwrap();
+        let live = agent.session_id.clone();
+        for name in agent.store.aliases_for(&live).unwrap() {
+            if name != "last" {
+                agent.store.delete_alias(&name).unwrap();
+            }
+        }
+
+        let deleted = agent.delete_alias("last").unwrap();
+
+        assert!(!deleted.session_deleted);
+        assert!(deleted.remaining.is_empty());
+        // The turn in progress is still appending here.
+        assert_eq!(agent.store.load(&live).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deleting_a_name_that_was_never_saved_still_errors() {
+        let agent = fake_agent();
+        assert!(agent.delete_alias("nope").is_err());
+    }
+
+    #[test]
+    fn startup_collects_the_conversationless_sessions_a_previous_launch_left() {
+        // One database opened three times over, standing in for three
+        // consecutive launches against the same store.
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "teleia-agent-launches-{}-{}.sqlite",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let llm = || LlmClient::new("http://127.0.0.1:0/v1", "test-model");
+
+        // A launch quit at the prompt: session, two aliases, system prompt.
+        let abandoned = {
+            let agent = Agent::new(llm(), Store::open_at(&path).unwrap()).unwrap();
+            agent.session_id.clone()
+        };
+        // One that actually got used.
+        let used = {
+            let mut agent = Agent::new(llm(), Store::open_at(&path).unwrap()).unwrap();
+            agent
+                .push(Message::User {
+                    content: "hi".into(),
+                })
+                .unwrap();
+            agent.session_id.clone()
+        };
+
+        let agent = Agent::new(llm(), Store::open_at(&path).unwrap()).unwrap();
+
+        assert!(agent.store.load(&abandoned).unwrap().is_empty());
+        assert!(agent.store.aliases_for(&abandoned).unwrap().is_empty());
+        assert_eq!(agent.store.load(&used).unwrap().len(), 2);
+        assert!(!agent.store.load(&agent.session_id).unwrap().is_empty());
     }
 
     #[test]
