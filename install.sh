@@ -81,21 +81,31 @@ verify_prebuilt() {
     else
         sums_url="$REPO/releases/download/$TAG/SHA256SUMS"
     fi
-    # curl exits 22 on an HTTP error, which is the honest "this release has
-    # no SHA256SUMS" answer. Every other non-zero exit is the network
-    # failing — DNS, a refused connection, a captive portal, a 5xx behind a
-    # proxy — and treating those as "no checksum published" is how an
-    # unverified binary lands on PATH exactly when something is wrong.
+    # Only a 404 is the honest "this release has no SHA256SUMS" answer.
+    # Anything else — DNS, a refused connection, a captive portal, a 5xx
+    # behind a proxy — is the network failing, and treating that as "no
+    # checksum published" is how an unverified binary lands on PATH exactly
+    # when something is wrong. `curl -f` cannot make that distinction: it
+    # collapses *every* status >= 400 into exit 22, so ask for the status
+    # code directly instead. Same rule as install.ps1's `$code -eq 404` and
+    # update.rs's `StatusCode::NOT_FOUND`.
     # `|| fetch_status=$?`, not a bare call: the script runs under `set -e`
     # (:17) and a standalone failing command would kill it before the status
     # could be read — silently, since neither branch below would run.
     fetch_status=0
-    curl -fsSL --output "$TMP/SHA256SUMS" "$sums_url" 2>/dev/null || fetch_status=$?
-    if [ "$fetch_status" -eq 22 ]; then
+    http_code="$(curl -sSL --output "$TMP/SHA256SUMS" --write-out '%{http_code}' \
+        "$sums_url" 2>/dev/null)" || fetch_status=$?
+    if [ "$fetch_status" -ne 0 ]; then
+        echo "error: could not fetch SHA256SUMS (curl exit $fetch_status)" >&2
+        echo "refusing to install unverified — re-run when the network is healthy." >&2
+        exit 1
+    fi
+    if [ "$http_code" = "404" ]; then
         echo "note: no SHA256SUMS for this release — skipping integrity check" >&2
         return 0
-    elif [ "$fetch_status" -ne 0 ]; then
-        echo "error: could not fetch SHA256SUMS (curl exit $fetch_status)" >&2
+    fi
+    if [ "$http_code" != "200" ]; then
+        echo "error: could not fetch SHA256SUMS (HTTP $http_code)" >&2
         echo "refusing to install unverified — re-run when the network is healthy." >&2
         exit 1
     fi

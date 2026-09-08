@@ -1395,11 +1395,26 @@ impl Agent {
                             Err(e) => format!("error: {e}"),
                         }
                     };
+                    // Both dispatch arms above render a failure as
+                    // `error: {e}` — including MCP, whose in-band
+                    // `isError` results come back as `Err` from
+                    // `tool_call_outcome` (cli/src/mcp.rs:341). So the
+                    // prefix is the whole truth about whether the call
+                    // failed, and every later test keys off it.
+                    let errored = output.starts_with("error: ");
                     // A dropped required argument (e.g. a large file `content`
                     // the model failed to encode in one call) comes back as a
                     // validation error; attach a recovery hint so the retry
                     // fixes the cause instead of repeating the same call.
-                    let output = if incomplete_tool_args(&output) {
+                    // Gated on `errored`: `incomplete_tool_args` is a bare
+                    // substring scan, so run on a *successful* result it
+                    // fires on any output that merely contains the phrase —
+                    // a `read` of a file mentioning `missing field`, or a
+                    // `typecheck` relaying rustc's own "missing field `x` in
+                    // initializer". That pinned a false hint to a correct
+                    // result and, via the streak below, ended the turn on the
+                    // third honest call.
+                    let output = if errored && incomplete_tool_args(&output) {
                         format!("{output}{INCOMPLETE_TOOL_ARGS_HINT}")
                     } else {
                         output
@@ -1408,12 +1423,10 @@ impl Agent {
                     // model is retrying blindly, not correcting. Name the
                     // loop on the second failure; arm the stop on the third
                     // (the round still finishes so no call is orphaned).
-                    let failed =
-                        output.starts_with("error: ") || incomplete_tool_args(&output);
                     let streak = retry_streak.record(
                         &call.function.name,
                         &call.function.arguments,
-                        failed,
+                        errored,
                     );
                     let output = if streak >= 2 {
                         format!("{output}{REPEATED_CALL_HINT}")
@@ -1720,6 +1733,52 @@ mod tests {
         );
         assert_eq!(assistant_text(&events), "recovered");
         server.join().expect("all scripted rounds consumed");
+    }
+
+    #[tokio::test]
+    async fn successful_output_containing_the_trigger_phrase_is_not_a_failure() {
+        // `incomplete_tool_args` is a bare substring scan. Run on a
+        // *successful* result it fires on any output that merely mentions
+        // the phrase — rustc's own "missing field `x` in initializer",
+        // relayed by `typecheck`, or a plain `read` of a file containing it
+        // (teleia's own agent/src/lib.rs does, several times over).
+        let path =
+            std::env::temp_dir().join(format!("teleia-trigger-phrase-{}.rs", std::process::id()));
+        std::fs::write(&path, "error[E0063]: missing field `detected_context`\n").unwrap();
+        let args = serde_json::to_string(&json!({ "path": path })).unwrap();
+
+        // Four rounds. The fourth is only reached if the turn did NOT stop
+        // itself after three "identical failing calls" — `server.join()`
+        // asserts every scripted round was consumed, so it is the real
+        // assertion that the circuit breaker stayed disarmed.
+        let (base, server) = scripted_llm(vec![
+            call("read", &args),
+            call("read", &args),
+            call("read", &args),
+            say("done"),
+        ]);
+        let mut agent = scripted_agent(base);
+        let events = drive(&mut agent, "read it three times").await;
+        let outputs = tool_outputs(&events);
+        assert_eq!(outputs.len(), 3);
+        for (i, out) in outputs.iter().enumerate() {
+            assert!(!out.starts_with("error: "), "read {i} failed: {out}");
+            assert!(
+                out.contains("missing field"),
+                "read {i} lost content: {out}"
+            );
+            assert!(
+                !out.contains(INCOMPLETE_TOOL_ARGS_HINT),
+                "read {i} got a dropped-argument hint it never earned: {out}"
+            );
+            assert!(
+                !out.contains(REPEATED_CALL_HINT),
+                "read {i} was counted into the retry streak: {out}"
+            );
+        }
+        assert_eq!(assistant_text(&events), "done");
+        server.join().expect("all scripted rounds consumed");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

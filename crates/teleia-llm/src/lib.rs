@@ -1163,7 +1163,11 @@ fn to_anthropic_messages(messages: &[Message]) -> (Option<Value>, Vec<Value>) {
             } => {
                 let mut blocks: Vec<Value> = Vec::new();
                 if let Some(text) = content {
-                    if !text.is_empty() {
+                    // Anthropic rejects a text block that is empty *or* all
+                    // whitespace ("text content blocks must contain
+                    // non-whitespace text"), so such a turn has to be
+                    // dropped rather than sent trimmed.
+                    if !text.trim().is_empty() {
                         blocks.push(serde_json::json!({ "type": "text", "text": text }));
                     }
                 }
@@ -1175,10 +1179,16 @@ fn to_anthropic_messages(messages: &[Message]) -> (Option<Value>, Vec<Value>) {
                         "input": parse_tool_input(&tc.function.arguments),
                     }));
                 }
-                // An assistant turn must be non-empty.
-                if blocks.is_empty() {
-                    blocks.push(serde_json::json!({ "type": "text", "text": "" }));
-                }
+                // A content-less, tool-call-less assistant turn cannot be
+                // represented at all: an empty `content` array and an empty
+                // text block are both 400s. Skip it. A round that was all
+                // reasoning stores exactly this shape (the agent does not
+                // accumulate reasoning into its content buffer), and once it
+                // is in the history every later request 400s — including
+                // /compact, which resends it — so the session is
+                // unrecoverable short of /reset. `push_block` merges
+                // same-role neighbours, so dropping the turn cannot break
+                // user/assistant alternation.
                 for b in blocks {
                     push_block(&mut out, "assistant", b);
                 }
@@ -2020,6 +2030,66 @@ mod tests {
                 arguments: args.into(),
             },
         }
+    }
+
+    #[test]
+    fn to_anthropic_messages_drops_an_empty_assistant_turn() {
+        // A round that was all reasoning (or whose only content chunk was
+        // dropped) stores `content: None, tool_calls: []`. Emitting it as
+        // `{"type":"text","text":""}` is a 400 — "text content blocks must
+        // contain non-whitespace text" — on this and every later request,
+        // /compact included, so the session dies until /reset.
+        for empty in [None, Some(String::new()), Some("   \n".to_string())] {
+            let msgs = vec![
+                Message::User {
+                    content: "first".into(),
+                },
+                Message::Assistant {
+                    content: empty.clone(),
+                    tool_calls: vec![],
+                },
+                Message::User {
+                    content: "second".into(),
+                },
+            ];
+            let (_system, out) = to_anthropic_messages(&msgs);
+
+            let blocks: Vec<&Value> = out
+                .iter()
+                .flat_map(|m| m["content"].as_array().unwrap().iter())
+                .collect();
+            assert!(
+                blocks
+                    .iter()
+                    .all(|b| b["type"] != "text" || !b["text"].as_str().unwrap().trim().is_empty()),
+                "emitted a blank text block for {empty:?}: {out:?}"
+            );
+            // The turn is dropped, so the two user turns merge into one.
+            assert_eq!(out.len(), 1, "{empty:?} -> {out:?}");
+            assert_eq!(out[0]["role"], "user");
+            assert_eq!(out[0]["content"].as_array().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn to_anthropic_messages_keeps_a_tool_only_assistant_turn() {
+        // The same branch must not swallow a turn that carries tool_use but
+        // no prose — the common shape for a tool-calling round.
+        let msgs = vec![
+            Message::User {
+                content: "go".into(),
+            },
+            Message::Assistant {
+                content: None,
+                tool_calls: vec![tc("t1", "read", r#"{"path":"a"}"#)],
+            },
+        ];
+        let (_system, out) = to_anthropic_messages(&msgs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1]["role"], "assistant");
+        let blocks = out[1]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
     }
 
     #[test]
