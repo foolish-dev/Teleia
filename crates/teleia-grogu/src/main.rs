@@ -525,7 +525,13 @@ fn nearest_predefined(theme: &Theme) -> String {
 
 fn hex_to_rgb_or_zero(hex: &str) -> [i32; 3] {
     let s = hex.trim_start_matches('#');
-    if s.len() != 6 {
+    // Both halves of this guard are load-bearing. `len()` counts bytes,
+    // so a six-*byte* string holding a two-byte char — `aébcd` — passes a
+    // length check and then *panics*, because `&s[0..2]` would split that
+    // char. And `from_str_radix` accepts a sign, so `-1-2-3` parses to
+    // negative channels and the function's name becomes a lie. Demand six
+    // ASCII hex digits and nothing else.
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return [0, 0, 0];
     }
     let parse = |a, b| i32::from_str_radix(&s[a..b], 16).unwrap_or(0);
@@ -625,6 +631,30 @@ fn apply_noctalia_grogu_scheme(theme: &Theme, dark: bool, dry_run: bool) -> Resu
     ))
 }
 
+/// Set the three colour-scheme keys on an already-parsed settings doc,
+/// touching nothing else.
+///
+/// Split out of [`patch_noctalia_settings`] so this module's promise —
+/// that every other key in a user's `settings.json` survives — is
+/// assertable without a filesystem. It is the only part of the write
+/// that can be got wrong silently: the file still parses afterwards, so
+/// nothing complains, and Noctalia stores its wallpaper and matugen
+/// state in the same `colorSchemes` object this reaches into.
+fn patch_noctalia_doc(doc: &mut Value, scheme: &str, dark: bool) -> Result<()> {
+    let root = doc
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("noctalia settings.json is not a JSON object"))?;
+    let cs = root
+        .entry("colorSchemes")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("colorSchemes is not a JSON object"))?;
+    cs.insert("useWallpaperColors".into(), Value::Bool(false));
+    cs.insert("predefinedScheme".into(), Value::String(scheme.into()));
+    cs.insert("darkMode".into(), Value::Bool(dark));
+    Ok(())
+}
+
 fn patch_noctalia_settings(
     settings_path: &std::path::Path,
     scheme: &str,
@@ -639,17 +669,7 @@ fn patch_noctalia_settings(
     } else {
         Value::Object(serde_json::Map::new())
     };
-    let root = doc
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("noctalia settings.json is not a JSON object"))?;
-    let cs = root
-        .entry("colorSchemes")
-        .or_insert_with(|| Value::Object(serde_json::Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("colorSchemes is not a JSON object"))?;
-    cs.insert("useWallpaperColors".into(), Value::Bool(false));
-    cs.insert("predefinedScheme".into(), Value::String(scheme.into()));
-    cs.insert("darkMode".into(), Value::Bool(dark));
+    patch_noctalia_doc(&mut doc, scheme, dark)?;
 
     if dry_run {
         return Ok(());
@@ -1573,5 +1593,165 @@ fn reload_tmux() -> String {
         Ok(s) if s.success() => format!("reload: tmux source-file {}", path.display()),
         Ok(s) => format!("reload: tmux source-file exited {s}"),
         Err(e) => format!("reload: tmux source-file failed ({e})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patching_noctalia_settings_leaves_every_other_key_alone() {
+        // This module's header promises the rest of a user's
+        // settings.json survives. Noctalia keeps its wallpaper and
+        // matugen state in the same `colorSchemes` object grogu reaches
+        // into, so replacing the object instead of editing three keys
+        // would delete live config and still leave a file that parses.
+        let mut doc = serde_json::json!({
+            "bar": { "position": "top", "widgets": ["clock", "tray"] },
+            "colorSchemes": {
+                "useWallpaperColors": true,
+                "matugenScheme": "scheme-tonal-spot",
+                "darkMode": false
+            },
+            "dock": { "autoHide": true }
+        });
+        patch_noctalia_doc(&mut doc, "Dracula", true).expect("object root");
+
+        let cs = &doc["colorSchemes"];
+        assert_eq!(cs["predefinedScheme"], "Dracula");
+        assert_eq!(cs["useWallpaperColors"], false);
+        assert_eq!(cs["darkMode"], true);
+        // Untouched, both beside and inside the object we edited.
+        assert_eq!(cs["matugenScheme"], "scheme-tonal-spot");
+        assert_eq!(doc["bar"]["position"], "top");
+        assert_eq!(doc["bar"]["widgets"][1], "tray");
+        assert_eq!(doc["dock"]["autoHide"], true);
+    }
+
+    #[test]
+    fn patching_noctalia_settings_preserves_key_order() {
+        // "Verbatim" covers ordering too. Without serde_json's
+        // `preserve_order` its Map is a BTreeMap, so serialising re-sorts
+        // every object at every depth and rewrites the user's whole file
+        // — silently, since it still parses and every value survives.
+        let src = r#"{"zebra":1,"alpha":2,"colorSchemes":{"zzz":1,"aaa":2},"middle":3}"#;
+        let mut doc: Value = serde_json::from_str(src).unwrap();
+        patch_noctalia_doc(&mut doc, "Catppuccin", false).unwrap();
+        let out = serde_json::to_string(&doc).unwrap();
+
+        let zebra = out.find("\"zebra\"").expect("zebra present");
+        let alpha = out.find("\"alpha\"").expect("alpha present");
+        let middle = out.find("\"middle\"").expect("middle present");
+        assert!(zebra < alpha, "top-level keys were re-sorted: {out}");
+        assert!(alpha < middle, "top-level keys were re-sorted: {out}");
+        let zzz = out.find("\"zzz\"").expect("zzz present");
+        let aaa = out.find("\"aaa\"").expect("aaa present");
+        assert!(zzz < aaa, "nested keys were re-sorted: {out}");
+    }
+
+    #[test]
+    fn patching_noctalia_settings_refuses_a_root_it_does_not_understand() {
+        // The guard is the only thing between a malformed-but-user-owned
+        // file and a clobber: on `Err` the caller never reaches the write.
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!("a string"),
+            serde_json::json!(null),
+            serde_json::json!(3),
+        ] {
+            let mut doc = bad.clone();
+            assert!(
+                patch_noctalia_doc(&mut doc, "Dracula", true).is_err(),
+                "accepted a non-object root: {bad}"
+            );
+        }
+        // And a `colorSchemes` that is not an object is refused too,
+        // rather than silently replaced.
+        let mut doc = serde_json::json!({ "colorSchemes": null });
+        assert!(patch_noctalia_doc(&mut doc, "Dracula", true).is_err());
+    }
+
+    #[test]
+    fn hex_to_rgb_or_zero_takes_six_ascii_hex_digits_and_nothing_else() {
+        assert_eq!(hex_to_rgb_or_zero("#1a2b3c"), [0x1a, 0x2b, 0x3c]);
+        assert_eq!(hex_to_rgb_or_zero("1A2B3C"), [0x1a, 0x2b, 0x3c]);
+        // Six *bytes* but five chars: `&s[0..2]` would split the two-byte
+        // `é` and panic. This is a real input — any theme file a user
+        // hand-edits can contain one.
+        assert_eq!(hex_to_rgb_or_zero("aébcd"), [0, 0, 0]);
+        // `from_str_radix` accepts a sign, so this used to yield negative
+        // channels from a function that promises zero on failure.
+        assert_eq!(hex_to_rgb_or_zero("#-1-2-3"), [0, 0, 0]);
+        assert_eq!(hex_to_rgb_or_zero("#gggggg"), [0, 0, 0]);
+        assert_eq!(hex_to_rgb_or_zero(""), [0, 0, 0]);
+        assert_eq!(hex_to_rgb_or_zero("#abc"), [0, 0, 0]);
+    }
+
+    #[test]
+    fn nearest_predefined_maps_each_bundled_theme_to_its_own_slug() {
+        // Round-trip identity is the cheapest check on the distance
+        // metric: transpose bg and purple, or flip a sign in sq_dist, and
+        // it still returns a valid slug — so every extracted wallpaper
+        // just quietly picks the wrong scheme forever.
+        for t in predefined_themes() {
+            assert_eq!(nearest_predefined(&t), t.slug, "theme {}", t.slug);
+        }
+    }
+
+    #[test]
+    fn teleia_palette_json_carries_every_key_teleia_parses() {
+        // The other side of this contract is `parse_hex_palette` in
+        // teleia-cli/src/tui.rs, which returns None if any one key is
+        // missing or malformed — and teleia then falls back to the named
+        // theme with no error anywhere. Rename a key here and the only
+        // symptom is the wrong colours after the next wallpaper change.
+        let t = predefined_themes().remove(0);
+        let v: Value = serde_json::from_str(&teleia_palette_json(&t)).expect("valid json");
+        for key in [
+            "bg", "bg_hl", "fg", "dim", "red", "green", "yellow", "blue", "purple", "cyan",
+        ] {
+            let hex = v[key].as_str().unwrap_or_else(|| panic!("missing `{key}`"));
+            let body = hex
+                .strip_prefix('#')
+                .unwrap_or_else(|| panic!("`{key}` = {hex}"));
+            assert_eq!(body.len(), 6, "`{key}` = {hex}");
+            assert!(
+                body.bytes().all(|b| b.is_ascii_hexdigit()),
+                "`{key}` = {hex}"
+            );
+        }
+    }
+
+    #[test]
+    fn hue_distance_wraps_across_zero() {
+        // Hue is a circle. Drop the wrap and red-ish wallpapers stop
+        // matching the red target — 350 vs 25 reads as 325 apart rather
+        // than 35 — pushing every warm accent through the blend instead.
+        assert_eq!(hue_distance(350.0, 10.0), 20.0);
+        assert_eq!(hue_distance(10.0, 350.0), 20.0);
+        assert_eq!(hue_distance(0.0, 180.0), 180.0);
+        assert_eq!(hue_distance(0.0, 360.0), 0.0);
+        assert_eq!(hue_distance(25.0, 25.0), 0.0);
+    }
+
+    #[test]
+    fn lab_to_hex_clamps_out_of_gamut_colours() {
+        // Every consumer parses this with a strict six-hex-digit check —
+        // teleia's `parse_hex_palette`, and grogu's own
+        // `hex_to_rgb_or_zero` — so one `#1a2b3` from a clamp regression
+        // breaks the extracted palette everywhere at once.
+        for c in [
+            Lab::new(150.0, 120.0, -120.0),
+            Lab::new(-50.0, -200.0, 200.0),
+            Lab::new(0.0, 0.0, 0.0),
+        ] {
+            let hex = lab_to_hex(c);
+            let body = hex.strip_prefix('#').unwrap_or_else(|| panic!("{hex}"));
+            assert_eq!(body.len(), 6, "{hex}");
+            assert!(body.bytes().all(|b| b.is_ascii_hexdigit()), "{hex}");
+            // And it round-trips through the parser it will meet.
+            assert_ne!(hex_to_rgb_or_zero(&hex), [-1, -1, -1]);
+        }
     }
 }
