@@ -285,9 +285,10 @@ args    = ["run", "-i", "--rm", "ghcr.io/github/github-mcp-server"]
 [mcps.github.env]
 GITHUB_PERSONAL_ACCESS_TOKEN = "ghp_…"
 
-# LSP server. Spawned + initialised at startup; pull diagnostics and
-# hover are exposed to the agent as `lsp_diagnostics` and `lsp_hover`.
-# Definition / references / workspace ops are still TODO.
+# LSP server. Spawned + initialised at startup; diagnostics, hover,
+# definition, references and workspace symbol search are exposed to the
+# agent as `lsp_diagnostics`, `lsp_hover`, `lsp_definition`,
+# `lsp_references` and `lsp_symbols`.
 [lsps.rust]
 command       = "rust-analyzer"
 root_patterns = ["Cargo.toml"]
@@ -295,7 +296,9 @@ root_patterns = ["Cargo.toml"]
 
 **MCP**: teleia speaks newline-delimited JSON-RPC over stdio — `initialize` + `notifications/initialized` + `tools/list` + `tools/call` + `resources/list`. Spawn failures stderr-warn but don't abort boot. `/mcps` lists running servers with tool + resource counts.
 
-**LSP**: real Content-Length-framed JSON-RPC client. Each configured server gets `initialize` + `initialized`. `/lsps` shows live status + advertised `serverInfo`. `lsp_diagnostics` (pull diagnostics) and `lsp_hover` are exposed to the agent; one-shot `textDocument/didOpen` lazily on first request. Definition / references / workspace ops are still TODO.
+**LSP**: real Content-Length-framed JSON-RPC client. Each configured server gets `initialize` + `initialized`. `/lsps` shows live status + advertised `serverInfo`. Five tools reach the agent: `lsp_diagnostics` (pull diagnostics), `lsp_hover`, `lsp_definition`, `lsp_references` and `lsp_symbols` (`workspace/symbol`). Documents get a one-shot `textDocument/didOpen` lazily on first request, then a `didChange` per re-query; before a references call every open document whose mtime moved is re-synced, since that answer carries positions in files other than the one being queried. Requests are bounded at 30 s, and a server that misses that deadline is fenced off for the session rather than left to desynchronise the frame reader. Results fan out across every server that advertised the capability, then dedupe on (path, line, column). Rename and call hierarchy are out of scope — they are writes.
+
+Positions are 1-based everywhere they cross the agent boundary, so any `<path>:<line>:<col>` a tool prints feeds straight back into another one.
 
 ## Layout
 
