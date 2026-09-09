@@ -315,7 +315,7 @@ pub fn definitions() -> Vec<ToolDef> {
             json!({ "type": "object", "properties": {
                 "path": { "type": "string" },
                 "pattern": { "type": "string", "description": "Rust regex to match" },
-                "replacement": { "type": "string", "description": "Replacement text; `$1`/`$name` expand capture groups" },
+                "replacement": { "type": "string", "description": "Replacement text; `$1`/`$name` expand capture groups. Write `$$` for a literal `$` — a `$name` that is not a group is an error, not literal text" },
                 "all": { "type": "boolean", "description": "Replace every match (default true); false replaces only the first" }
             }, "required": ["path", "pattern", "replacement"] }),
         ),
@@ -1912,6 +1912,64 @@ fn default_true() -> bool {
     true
 }
 
+// The regex crate's replacement expansion cannot fail: a `$name` or `$N`
+// that names no capture group is substituted with the empty string. So
+// `replacement: "$HOME/.config"` silently writes `/.config` and the tool
+// still reports a successful replacement — same for JS template literals
+// (`${count}`) and CI variables. Reject the reference instead of eating it;
+// `$$` is the escape for a literal dollar. The scan mirrors the crate's own
+// grammar: `$` + `[0-9A-Za-z_]+` unbraced (longest run), or `${...}` up to
+// the first `}`, with an all-digit name meaning a group index.
+fn check_capture_refs(re: &regex::Regex, replacement: &str) -> Result<()> {
+    let known = |name: &str| match name.parse::<usize>() {
+        Ok(i) => i < re.captures_len(),
+        Err(_) => re.capture_names().any(|n| n == Some(name)),
+    };
+    let bytes = replacement.as_bytes();
+    let mut i = 0;
+    while let Some(off) = bytes[i..].iter().position(|&b| b == b'$') {
+        let dollar = i + off;
+        let (name, end) = match bytes.get(dollar + 1) {
+            Some(b'$') => {
+                i = dollar + 2;
+                continue;
+            }
+            Some(b'{') => match replacement[dollar + 2..].find('}') {
+                // An unclosed `${` is not a reference at all.
+                None => {
+                    i = dollar + 1;
+                    continue;
+                }
+                Some(brace) => {
+                    let end = dollar + 2 + brace;
+                    (&replacement[dollar + 2..end], end + 1)
+                }
+            },
+            _ => {
+                let run = bytes[dollar + 1..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+                    .count();
+                if run == 0 {
+                    i = dollar + 1;
+                    continue;
+                }
+                let end = dollar + 1 + run;
+                (&replacement[dollar + 1..end], end)
+            }
+        };
+        if !known(name) {
+            return Err(anyhow!(
+                "replacement references `{}`, but `{}` has no such capture group; write `$$` for a literal `$`",
+                &replacement[dollar..end],
+                re.as_str()
+            ));
+        }
+        i = end;
+    }
+    Ok(())
+}
+
 async fn replace_tool(args: Value) -> Result<String> {
     let ReplaceArgs {
         path,
@@ -1920,6 +1978,7 @@ async fn replace_tool(args: Value) -> Result<String> {
         all,
     } = serde_json::from_value(args)?;
     let re = regex::Regex::new(&pattern).with_context(|| format!("invalid regex: {pattern}"))?;
+    check_capture_refs(&re, &replacement)?;
     let src = tokio::fs::read_to_string(&path)
         .await
         .with_context(|| format!("read {path}"))?;
@@ -2986,6 +3045,31 @@ mod tests {
             .to_string();
         dispatch("replace", &first).await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[1] a2");
+    }
+
+    #[tokio::test]
+    async fn replace_rejects_unknown_capture_reference() {
+        let path = tmp_path("replace-dollar.txt");
+        let _c = Cleanup(path.clone());
+        std::fs::write(&path, "export CONFIG=PLACEHOLDER").unwrap();
+        // `$HOME` names no group, and the regex crate expands it to the empty
+        // string: unchecked, the file becomes "export CONFIG=/.config".
+        let bad = json!({ "path": path.to_str().unwrap(), "pattern": "PLACEHOLDER", "replacement": "$HOME/.config" })
+            .to_string();
+        let err = dispatch("replace", &bad).await.unwrap_err().to_string();
+        assert!(err.contains("$HOME"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "export CONFIG=PLACEHOLDER"
+        );
+        // `$$` still escapes, and a real group still expands.
+        let ok = json!({ "path": path.to_str().unwrap(), "pattern": "PLACE(HOLDER)", "replacement": "$$${1}" })
+            .to_string();
+        dispatch("replace", &ok).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "export CONFIG=$HOLDER"
+        );
     }
 
     #[tokio::test]
