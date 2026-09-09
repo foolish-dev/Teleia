@@ -1700,8 +1700,12 @@ async fn git_tool(args: Value) -> Result<String> {
             return run_command("git", &["commit", "-m", msg]).await;
         }
     });
-    // add/diff take the caller's paths; status/log ignore them.
+    // add/diff take the caller's paths; status/log ignore them. `--` first:
+    // a path is a pathspec, never argv, and without the separator git reads a
+    // leading-dash entry as an option — `--output=FILE` turned a read-only
+    // `git diff` into a write of the model's choosing.
     if matches!(subcommand, GitSub::Add | GitSub::Diff) {
+        argv.push("--");
         argv.extend(paths.iter().map(String::as_str));
     }
     run_command("git", &argv).await
@@ -2726,6 +2730,21 @@ mod tests {
         assert!(dispatch("git", &add).await.is_err());
         let commit = json!({ "subcommand": "commit" }).to_string();
         assert!(dispatch("git", &commit).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn git_diff_paths_cannot_smuggle_options() {
+        // `paths` is a pathspec, not argv: with no `--` separator git read
+        // `--output=FILE` as an option and wrote the diff to that file.
+        let out = tmp_path("git-diff-output.diff");
+        let _c = Cleanup(out.clone());
+        let args = json!({
+            "subcommand": "diff",
+            "paths": [format!("--output={}", out.display())],
+        })
+        .to_string();
+        let _ = dispatch("git", &args).await;
+        assert!(!out.exists(), "`git diff` read a path as an option");
     }
 
     #[tokio::test]
