@@ -271,7 +271,7 @@ impl Store {
                     SELECT 1 FROM messages
                      WHERE messages.session_id = sessions.id
                        AND (NOT json_valid(payload)
-                            OR json_extract(payload, '$.role') <> 'system')
+                            OR json_extract(payload, '$.role') IS NOT 'system')
                 )",
             params![keep],
         )?;
@@ -506,6 +506,27 @@ mod tests {
 
         assert_eq!(store.prune_empty_sessions(&active).unwrap(), 0);
         assert_eq!(store.next_seq(&corrupt).unwrap(), 2);
+    }
+
+    #[test]
+    fn prune_keeps_a_session_whose_only_content_is_json_without_a_role() {
+        let path = tmp_db();
+        let _cleanup = Cleanup(path.clone());
+        let store = Store::open_at(&path).unwrap();
+        let active = store.create_session("m").unwrap();
+        let legacy = store.create_session("m").unwrap();
+        store.append(&legacy, 0, &system()).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO messages (session_id, seq, payload)
+                 VALUES (?1, 1, '{\"type\":\"user\",\"text\":\"hi\"}')",
+                params![legacy],
+            )
+            .unwrap();
+
+        assert_eq!(store.prune_empty_sessions(&active).unwrap(), 0);
+        assert_eq!(store.next_seq(&legacy).unwrap(), 2);
     }
 
     #[test]
